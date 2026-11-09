@@ -57,6 +57,59 @@ async function verifyAll() {
     }
     checkDirClean(PROJECT_DIR);
     console.log('[PASS] Strict User Data Isolation verified: zero user saves, credentials, or personal files in repository.');
+
+    // 5. Execute Headless Worldgen, Spline Evaluation, Structure Placement, Chunk Meshing & Physics Tick
+    const sandbox = {
+        window: { addEventListener: () => {}, innerWidth: 1280, innerHeight: 720 },
+        document: { addEventListener: () => {}, getElementById: () => null },
+        performance: { now: () => Date.now() },
+        navigator: { hardwareConcurrency: 4 },
+        WebAssembly,
+        Uint8Array, Uint16Array, Uint32Array, Int8Array, Int16Array, Int32Array, Float32Array, Float64Array,
+        DataView, ArrayBuffer, Map, Set, Math, BigInt, Number, String, Object, Array, Promise, Error,
+        TextEncoder, TextDecoder, DecompressionStream, CompressionStream, Blob, Response,
+        console, setTimeout, clearTimeout,
+        __exports: {},
+    };
+    const testHarnessCode = bundleCode.replace(
+        /\}\)\(\);\s*$/,
+        '  __exports.WorldgenNoiseRouter = WorldgenNoiseRouter;\n' +
+        '  __exports.ClientWorld = ClientWorld;\n' +
+        '  __exports.ChunkMesher = ChunkMesher;\n' +
+        '  __exports.JvmWasmCore = JvmWasmCore;\n' +
+        '  __exports.parseStructureTemplateNbt = parseStructureTemplateNbt;\n' +
+        '})();\n'
+    );
+    vm.runInNewContext(testHarnessCode, sandbox, { filename: 'bootstrap.js' });
+    const { WorldgenNoiseRouter, ClientWorld, ChunkMesher, parseStructureTemplateNbt } = sandbox.__exports;
+    const router = new WorldgenNoiseRouter(2632026n, wg);
+    const world = new ClientWorld(reg.blocks, reg.biomes, router);
+    const nbtBytes = new Uint8Array(fs.readFileSync(path.join(PUBLIC_ASSETS, 'structures/abandoned_camp__camp__dappled_forest__campsite_dappled_forest_1.nbt')));
+    const tmpl = await parseStructureTemplateNbt(nbtBytes);
+    world.structures.set('abandoned_camp/campsite_dappled_forest_1', tmpl);
+    const mesher = new ChunkMesher(world, reg.atlases.blocks.uvs);
+
+    let totalOpaqueVerts = 0;
+    let totalCutoutVerts = 0;
+    let totalTranslucentVerts = 0;
+    for (let cx = -2; cx <= 2; cx++) {
+        for (let cz = -2; cz <= 2; cz++) {
+            const col = world.getOrCreateChunk(cx, cz);
+            const mesh = mesher.buildChunkMesh(col);
+            totalOpaqueVerts += mesh.opaqueVertexCount;
+            totalCutoutVerts += mesh.cutoutVertexCount;
+            totalTranslucentVerts += mesh.translucentVertexCount;
+        }
+    }
+    world.tick(8.5, 80.0, 8.5);
+    if (totalOpaqueVerts === 0) {
+        throw new Error('ChunkMesher produced 0 opaque vertices across 25 spawn chunks!');
+    }
+    console.log(
+        `[PASS] Headless 25-chunk spawn generation & meshing succeeded: ` +
+        `opaque=${totalOpaqueVerts} verts, cutout=${totalCutoutVerts} verts, translucent=${totalTranslucentVerts} verts, ` +
+        `entities=${world.entities.size}.`
+    );
     console.log('=== ALL CHECKS PASSED ===');
 }
 

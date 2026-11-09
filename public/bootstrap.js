@@ -2690,8 +2690,13 @@ class MinecraftProtocol263Client {
 
 
                                
-                        
                          
+                          
+                          
+                         
+                          
+                                   
+                            
  
 
                             
@@ -2817,16 +2822,19 @@ class NormalNoise {
                     maxValue        ;
 
     constructor(rng                      , firstOctave        , amplitudes          ) {
-        const n = amplitudes.length;
-        let freq = Math.pow(2.0, firstOctave);
-        let ampScale = Math.pow(2.0, n - 1) / (Math.pow(2.0, n) - 1.0);
+        const safeFirstOctave = typeof firstOctave === 'number' && Number.isFinite(firstOctave) ? firstOctave : -7;
+        const safeAmplitudes = Array.isArray(amplitudes) && amplitudes.length > 0 ? amplitudes : [1.0];
+        const n = safeAmplitudes.length;
+        let freq = Math.pow(2.0, safeFirstOctave);
+        const denom = Math.pow(2.0, n) - 1.0;
+        let ampScale = denom > 0.0 ? Math.pow(2.0, n - 1) / denom : 1.0;
 
         // First PerlinNoise octaves via positional fork
         const fork1 = rng.forkPositional();
         for (let i = 0; i < n; i++) {
-            const amp = amplitudes[i];
+            const amp = safeAmplitudes[i];
             if (amp !== 0.0) {
-                const octaveNum = firstOctave + i;
+                const octaveNum = safeFirstOctave + i;
                 const octRng = fork1.fromHashOf(`octave_${octaveNum}`);
                 this.firstOctaves.push({ noise: new ImprovedNoise(octRng), amp: amp * ampScale, freq });
             }
@@ -2835,13 +2843,13 @@ class NormalNoise {
         }
 
         // Second PerlinNoise octaves via positional fork
-        freq = Math.pow(2.0, firstOctave);
-        ampScale = Math.pow(2.0, n - 1) / (Math.pow(2.0, n) - 1.0);
+        freq = Math.pow(2.0, safeFirstOctave);
+        ampScale = denom > 0.0 ? Math.pow(2.0, n - 1) / denom : 1.0;
         const fork2 = rng.forkPositional();
         for (let i = 0; i < n; i++) {
-            const amp = amplitudes[i];
+            const amp = safeAmplitudes[i];
             if (amp !== 0.0) {
-                const octaveNum = firstOctave + i;
+                const octaveNum = safeFirstOctave + i;
                 const octRng = fork2.fromHashOf(`octave_${octaveNum}`);
                 this.secondOctaves.push({ noise: new ImprovedNoise(octRng), amp: amp * ampScale, freq });
             }
@@ -2852,12 +2860,13 @@ class NormalNoise {
         let minActive = Infinity;
         let maxActive = -Infinity;
         for (let i = 0; i < n; i++) {
-            if (amplitudes[i] !== 0.0) {
+            if (safeAmplitudes[i] !== 0.0) {
                 minActive = Math.min(minActive, i);
                 maxActive = Math.max(maxActive, i);
             }
         }
-        const expectedDeviation = 0.1 * (1.0 + 1.0 / (maxActive - minActive + 1));
+        const span = maxActive >= minActive ? (maxActive - minActive + 1) : 1;
+        const expectedDeviation = 0.1 * (1.0 + 1.0 / span);
         this.valueFactor = (1.0 / 6.0) / expectedDeviation;
 
         let maxSum = 0;
@@ -2959,110 +2968,211 @@ class WorldgenNoiseRouter {
         let inst = this.noiseInstances.get(clean);
         if (inst) return inst;
 
-        const params = this.worldgenData.noises[clean] || { firstOctave: -7, amplitudes: [1.0, 1.0] };
+        const rawParams =
+            this.worldgenData.noises[clean] ||
+            this.worldgenData.noises[`minecraft:${clean}`];
+        let firstOctave = -7;
+        let amplitudes           = [1.0, 1.0];
+
+        if (rawParams) {
+            firstOctave =
+                rawParams.base_octave ??
+                rawParams.firstOctave ??
+                rawParams.first_octave ??
+                -7;
+            if (Array.isArray(rawParams.amplitudes) && rawParams.amplitudes.length > 0) {
+                amplitudes = rawParams.amplitudes;
+            } else {
+                const baseAmp =
+                    typeof rawParams.base_amplitude === 'number'
+                        ? rawParams.base_amplitude
+                        : 1.0;
+                const mods = Array.isArray(rawParams.amplitude_modifiers)
+                    ? rawParams.amplitude_modifiers
+                    : null;
+                const count =
+                    typeof rawParams.octave_count === 'number'
+                        ? Math.max(1, rawParams.octave_count)
+                        : mods && mods.length > 0
+                        ? mods.length
+                        : 1;
+                amplitudes = new Array        (count);
+                for (let i = 0; i < count; i++) {
+                    const m = mods && i < mods.length ? Number(mods[i]) : 1.0;
+                    amplitudes[i] = m * baseAmp;
+                }
+            }
+        }
+
         const rng = this.randomFactory.fromHashOf(`minecraft:${clean}`);
-        inst = new NormalNoise(rng, params.firstOctave, params.amplitudes);
+        inst = new NormalNoise(rng, firstOctave, amplitudes);
         this.noiseInstances.set(clean, inst);
         return inst;
     }
 
     /**
      * Evaluates any DensityFunction AST node (`string` reference, `number` constant, or `{ type: "minecraft:..." }` object)
-     * at world coordinates `(x, y, z)`.
+     * at world coordinates `(x, y, z)`. Supports both Minecraft 26.3 (`left`/`right`/`input`/`gradient`/`lerp`)
+     * and legacy (`argument1`/`argument2`/`argument`/`y_clamped_gradient`) schemas.
      */
            evalDensityFunction(node         , x        , y        , z        , depth = 0)         {
         if (depth > 48) return 0.0;
         if (typeof node === 'number') return node;
         if (typeof node === 'string') {
             const cleanRef = node.replace('minecraft:', '');
-            const target = this.worldgenData.density_functions[cleanRef];
+            const target =
+                this.worldgenData.density_functions[cleanRef] ??
+                this.worldgenData.density_functions[`minecraft:${cleanRef}`];
             if (target !== undefined) {
                 return this.evalDensityFunction(target, x, y, z, depth + 1);
             }
+            if (cleanRef === 'y') return y;
             return 0.0;
         }
         if (!node || typeof node !== 'object') return 0.0;
 
         const obj = node                           ;
         const type = String(obj.type || '').replace('minecraft:', '');
+        const leftNode = obj.left !== undefined ? obj.left : obj.argument1;
+        const rightNode = obj.right !== undefined ? obj.right : obj.argument2;
+        const inputNode = obj.input !== undefined ? obj.input : obj.argument;
 
         switch (type) {
             case 'constant':
-                return Number(obj.argument ?? 0.0);
+                return Number(inputNode ?? 0.0);
 
             case 'add':
                 return (
-                    this.evalDensityFunction(obj.argument1, x, y, z, depth + 1) +
-                    this.evalDensityFunction(obj.argument2, x, y, z, depth + 1)
+                    this.evalDensityFunction(leftNode, x, y, z, depth + 1) +
+                    this.evalDensityFunction(rightNode, x, y, z, depth + 1)
+                );
+
+            case 'sub':
+                return (
+                    this.evalDensityFunction(leftNode, x, y, z, depth + 1) -
+                    this.evalDensityFunction(rightNode, x, y, z, depth + 1)
                 );
 
             case 'mul': {
-                const a1 = this.evalDensityFunction(obj.argument1, x, y, z, depth + 1);
+                const a1 = this.evalDensityFunction(leftNode, x, y, z, depth + 1);
                 if (a1 === 0.0) return 0.0;
-                return a1 * this.evalDensityFunction(obj.argument2, x, y, z, depth + 1);
+                return a1 * this.evalDensityFunction(rightNode, x, y, z, depth + 1);
+            }
+
+            case 'div': {
+                const num = this.evalDensityFunction(leftNode, x, y, z, depth + 1);
+                const den = this.evalDensityFunction(rightNode, x, y, z, depth + 1);
+                return Math.abs(den) > 1e-9 ? num / den : 0.0;
             }
 
             case 'min':
                 return Math.min(
-                    this.evalDensityFunction(obj.argument1, x, y, z, depth + 1),
-                    this.evalDensityFunction(obj.argument2, x, y, z, depth + 1)
+                    this.evalDensityFunction(leftNode, x, y, z, depth + 1),
+                    this.evalDensityFunction(rightNode, x, y, z, depth + 1)
                 );
 
             case 'max':
                 return Math.max(
-                    this.evalDensityFunction(obj.argument1, x, y, z, depth + 1),
-                    this.evalDensityFunction(obj.argument2, x, y, z, depth + 1)
+                    this.evalDensityFunction(leftNode, x, y, z, depth + 1),
+                    this.evalDensityFunction(rightNode, x, y, z, depth + 1)
                 );
 
             case 'clamp': {
-                const v = this.evalDensityFunction(obj.input, x, y, z, depth + 1);
+                const v = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 return Math.max(Number(obj.min ?? -1), Math.min(Number(obj.max ?? 1), v));
             }
 
             case 'abs':
-                return Math.abs(this.evalDensityFunction(obj.argument, x, y, z, depth + 1));
+                return Math.abs(this.evalDensityFunction(inputNode, x, y, z, depth + 1));
+
+            case 'negate':
+                return -this.evalDensityFunction(inputNode, x, y, z, depth + 1);
 
             case 'square': {
-                const v = this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                const v = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 return v * v;
             }
 
             case 'cube': {
-                const v = this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                const v = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 return v * v * v;
             }
 
             case 'half_negative': {
-                const v = this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                const v = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 return v > 0 ? v : v * 0.5;
             }
 
             case 'quarter_negative': {
-                const v = this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                const v = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 return v > 0 ? v : v * 0.25;
             }
 
             case 'squeeze': {
-                const v = Math.max(-1.0, Math.min(1.0, this.evalDensityFunction(obj.argument, x, y, z, depth + 1)));
+                const v = Math.max(-1.0, Math.min(1.0, this.evalDensityFunction(inputNode, x, y, z, depth + 1)));
                 return v / 2.0 - (v * v * v) / 24.0;
             }
 
+            case 'lerp': {
+                const alpha = this.evalDensityFunction(obj.alpha, x, y, z, depth + 1);
+                if (alpha <= 0.0) return this.evalDensityFunction(obj.first, x, y, z, depth + 1);
+                if (alpha >= 1.0) return this.evalDensityFunction(obj.second, x, y, z, depth + 1);
+                const first = this.evalDensityFunction(obj.first, x, y, z, depth + 1);
+                const second = this.evalDensityFunction(obj.second, x, y, z, depth + 1);
+                return first + alpha * (second - first);
+            }
+
+            case 'gradient':
             case 'y_clamped_gradient': {
-                const fromY = Number(obj.from_y ?? -64);
-                const toY = Number(obj.to_y ?? 320);
+                const axis = String(obj.axis || 'y');
+                const coord = axis === 'x' ? x : axis === 'z' ? z : y;
+                const fromCoord = Number(obj.from_coordinate ?? obj.from_y ?? -64);
+                const toCoord = Number(obj.to_coordinate ?? obj.to_y ?? 320);
                 const fromVal = Number(obj.from_value ?? 1);
                 const toVal = Number(obj.to_value ?? -1);
-                if (y <= fromY) return fromVal;
-                if (y >= toY) return toVal;
-                const t = (y - fromY) / (toY - fromY);
+                if (coord <= fromCoord) return fromVal;
+                if (coord >= toCoord) return toVal;
+                const t = (coord - fromCoord) / (toCoord - fromCoord);
                 return fromVal + t * (toVal - fromVal);
+            }
+
+            case 'slice': {
+                const axis = String(obj.axis || 'y');
+                const coord = Number(obj.coordinate ?? 0);
+                if (axis === 'x') return this.evalDensityFunction(inputNode, coord, y, z, depth + 1);
+                if (axis === 'z') return this.evalDensityFunction(inputNode, x, y, coord, depth + 1);
+                return this.evalDensityFunction(inputNode, x, coord, z, depth + 1);
+            }
+
+            case 'distance_to_point': {
+                const pt = Array.isArray(obj.point) ? obj.point : [0, 0, 0];
+                const dx = x - Number(pt[0] ?? 0);
+                const dy = y - Number(pt[1] ?? 0);
+                const dz = z - Number(pt[2] ?? 0);
+                return Math.sqrt(dx * dx + dy * dy + dz * dz);
+            }
+
+            case 'interval_select': {
+                const inp = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
+                const thresholds = Array.isArray(obj.thresholds) ? obj.thresholds : [];
+                const funcs = Array.isArray(obj.functions) ? obj.functions : [];
+                if (funcs.length === 0) return 0.0;
+                let idx = 0;
+                while (idx < thresholds.length && inp >= Number(thresholds[idx])) {
+                    idx++;
+                }
+                const chosen = funcs[Math.min(idx, funcs.length - 1)];
+                return this.evalDensityFunction(chosen, x, y, z, depth + 1);
             }
 
             case 'noise': {
                 const noiseName = String(obj.noise || 'minecraft:continentalness');
+                const sx = obj.shift_x !== undefined ? x + this.evalDensityFunction(obj.shift_x, x, y, z, depth + 1) : x;
+                const sy = obj.shift_y !== undefined ? y + this.evalDensityFunction(obj.shift_y, x, y, z, depth + 1) : y;
+                const sz = obj.shift_z !== undefined ? z + this.evalDensityFunction(obj.shift_z, x, y, z, depth + 1) : z;
                 const xzScale = Number(obj.xz_scale ?? 1.0);
                 const yScale = Number(obj.y_scale ?? 1.0);
-                return this.getNoise(noiseName).getValue(x * xzScale, y * yScale, z * xzScale);
+                return this.getNoise(noiseName).getValue(sx * xzScale, sy * yScale, sz * xzScale);
             }
 
             case 'shifted_noise': {
@@ -3076,22 +3186,22 @@ class WorldgenNoiseRouter {
             }
 
             case 'shift_a': {
-                const noiseName = String(obj.argument || 'minecraft:offset');
+                const noiseName = String(obj.noise || obj.argument || 'minecraft:offset');
                 return this.getNoise(noiseName).getValue(x * 0.25, 0.0, z * 0.25) * 4.0;
             }
 
             case 'shift_b': {
-                const noiseName = String(obj.argument || 'minecraft:offset');
+                const noiseName = String(obj.noise || obj.argument || 'minecraft:offset');
                 return this.getNoise(noiseName).getValue(z * 0.25, x * 0.25, 0.0) * 4.0;
             }
 
             case 'shift': {
-                const noiseName = String(obj.argument || 'minecraft:offset');
+                const noiseName = String(obj.noise || obj.argument || 'minecraft:offset');
                 return this.getNoise(noiseName).getValue(x * 0.25, y * 0.25, z * 0.25) * 4.0;
             }
 
             case 'range_choice': {
-                const inp = this.evalDensityFunction(obj.input, x, y, z, depth + 1);
+                const inp = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 const minInc = Number(obj.min_inclusive ?? -1000000);
                 const maxExc = Number(obj.max_exclusive ?? 1000000);
                 if (inp >= minInc && inp < maxExc) {
@@ -3101,7 +3211,7 @@ class WorldgenNoiseRouter {
             }
 
             case 'weird_scaled_sampler': {
-                const inp = this.evalDensityFunction(obj.input, x, y, z, depth + 1);
+                const inp = this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 const rarityType = String(obj.rarity_value_mapper || 'type_1');
                 const scale = rarityType === 'type_2'
                     ? (inp < -0.75 ? 0.5 : inp < -0.5 ? 0.75 : inp < 0.5 ? 1.0 : inp < 0.75 ? 2.0 : 3.0)
@@ -3118,13 +3228,14 @@ class WorldgenNoiseRouter {
             case 'spline':
                 return this.evalCubicSpline(obj.spline                   , x, y, z, depth + 1);
 
+            case 'cache':
             case 'flat_cache':
             case 'cache_2d':
             case 'cache_once':
             case 'cache_all_in_cell':
             case 'interpolated':
             case 'blend_density':
-                return this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                return this.evalDensityFunction(inputNode, x, y, z, depth + 1);
 
             case 'blend_alpha':
                 return 1.0;
@@ -3134,8 +3245,8 @@ class WorldgenNoiseRouter {
                 return 0.0;
 
             default:
-                if (obj.argument !== undefined) {
-                    return this.evalDensityFunction(obj.argument, x, y, z, depth + 1);
+                if (inputNode !== undefined) {
+                    return this.evalDensityFunction(inputNode, x, y, z, depth + 1);
                 }
                 return 0.0;
         }
@@ -3265,8 +3376,8 @@ class WorldgenNoiseRouter {
      */
            computeColumnHeight(x        , z        )                                                  {
         const sample = this.sampleOverworldRouter(x, 64, z);
-        // Map spline offset (-0.6 .. 1.2) to vanilla Overworld elevation (42 .. 190)
-        const baseElevation = 63 + sample.offset * 82.0;
+        // Solve vanilla overworld/depth = gradient(y: -64..320 -> 1.5..-1.5) + offset = 0 => y = 128 + offset * 128
+        const baseElevation = 128.0 + sample.offset * 128.0;
         const detail =
             this.getNoise('minecraft:surface').getValue(x * 0.25, 0, z * 0.25) * (10.0 / Math.max(0.6, sample.factor)) +
             this.getNoise('minecraft:ridge').getValue(x * 0.5, 0, z * 0.5) * 4.5;
@@ -3326,12 +3437,12 @@ class WorldgenNoiseRouter {
                      
                               
               
-                           
-                           
-                             
-                                 
-                             
-                               
+                                    
+                                    
+                                      
+                                          
+                                      
+                                        
       
  
 
@@ -3520,8 +3631,35 @@ class ClientWorld {
         biomes                      ,
         noiseRouter                     
     ) {
-        this.blocksById = blocks;
+        this.blocksById = new Array(blocks.length);
         for (const b of blocks) {
+            const raw = b                                      ;
+            const tex = (b.textures || {})                          ;
+            b.textures = {
+                up: tex.up || tex.top || tex.north || 'stone',
+                down: tex.down || tex.bottom || tex.north || 'stone',
+                north: tex.north || tex.top || 'stone',
+                south: tex.south || tex.north || 'stone',
+                east: tex.east || tex.north || 'stone',
+                west: tex.west || tex.north || 'stone',
+            };
+            if (!b.properties) {
+                b.properties = {
+                    mapColor: String(raw.mapColor ?? 'STONE'),
+                    soundType: String(raw.soundType ?? 'STONE'),
+                    instrument: String(raw.instrument ?? 'HARP'),
+                    destroyTime: Number(raw.destroyTime ?? 1),
+                    explosionResistance: Number(raw.explosionResistance ?? 1),
+                    noCollision: Boolean(raw.noCollision),
+                    noOcclusion: Boolean(raw.noOcclusion),
+                    replaceable: Boolean(raw.replaceable),
+                    randomTicks: Boolean(raw.randomTicks),
+                    requiresCorrectTool: Boolean(raw.requiresCorrectTool),
+                    air: Boolean(raw.air || b.name === 'air' || b.name === 'cave_air' || b.name === 'void_air'),
+                    liquid: Boolean(raw.liquid || b.name === 'water' || b.name === 'lava'),
+                };
+            }
+            this.blocksById[b.rawId] = b;
             this.blockByName.set(b.name, b);
         }
         this.biomesById = biomes;
@@ -3653,6 +3791,9 @@ class ClientWorld {
      */
            generateChunk(chunkX        , chunkZ        )              {
         const col = new ChunkColumn(chunkX, chunkZ);
+        if (this.idAir !== 0) {
+            col.blocks.fill(this.idAir);
+        }
         const seaLevel = 63;
         const baseX = chunkX << 4;
         const baseZ = chunkZ << 4;
@@ -4649,10 +4790,11 @@ function packRGBA(r        , g        , b        , a = 255)         {
     return ((r & 0xff) | ((g & 0xff) << 8) | ((b & 0xff) << 16) | ((a & 0xff) << 24)) >>> 0;
 }
 
-function unpackHexToRGBA(hex        , alpha = 255)         {
-    const r = (hex >>> 16) & 0xff;
-    const g = (hex >>> 8) & 0xff;
-    const b = hex & 0xff;
+function unpackHexToRGBA(hex                 , alpha = 255)         {
+    const num = typeof hex === 'string' ? parseInt(hex.replace('#', ''), 16) || 0xffffff : hex;
+    const r = (num >>> 16) & 0xff;
+    const g = (num >>> 8) & 0xff;
+    const b = num & 0xff;
     return packRGBA(r, g, b, alpha);
 }
 
@@ -6452,13 +6594,13 @@ class Minecraft263ClientApp {
         this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, noiseRouter);
         this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
 
-        // Load sample .nbt structure template
+        // Load sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
         try {
-            const nbtResp = await fetch('assets/structures/abandoned_camp__campsite_1.nbt');
+            const nbtResp = await fetch('assets/structures/abandoned_camp__camp__dappled_forest__campsite_dappled_forest_1.nbt');
             if (nbtResp.ok) {
                 const nbtBytes = new Uint8Array(await nbtResp.arrayBuffer());
                 const tmpl = await parseStructureTemplateNbt(nbtBytes);
-                this.world.structures.set('abandoned_camp/campsite_1', tmpl);
+                this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', tmpl);
             }
         } catch {}
 

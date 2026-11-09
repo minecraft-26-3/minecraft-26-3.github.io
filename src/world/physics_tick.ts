@@ -49,12 +49,12 @@ export interface BiomeRegistryEntry {
     downfall: number;
     hasPrecipitation: boolean;
     effects: {
-        sky_color?: number;
-        fog_color?: number;
-        water_color?: number;
-        water_fog_color?: number;
-        grass_color?: number;
-        foliage_color?: number;
+        sky_color?: number | string;
+        fog_color?: number | string;
+        water_color?: number | string;
+        water_fog_color?: number | string;
+        grass_color?: number | string;
+        foliage_color?: number | string;
     };
 }
 
@@ -243,8 +243,35 @@ export class ClientWorld {
         biomes: BiomeRegistryEntry[],
         noiseRouter: WorldgenNoiseRouter
     ) {
-        this.blocksById = blocks;
+        this.blocksById = new Array(blocks.length);
         for (const b of blocks) {
+            const raw = b as unknown as Record<string, unknown>;
+            const tex = (b.textures || {}) as Record<string, string>;
+            b.textures = {
+                up: tex.up || tex.top || tex.north || 'stone',
+                down: tex.down || tex.bottom || tex.north || 'stone',
+                north: tex.north || tex.top || 'stone',
+                south: tex.south || tex.north || 'stone',
+                east: tex.east || tex.north || 'stone',
+                west: tex.west || tex.north || 'stone',
+            };
+            if (!b.properties) {
+                b.properties = {
+                    mapColor: String(raw.mapColor ?? 'STONE'),
+                    soundType: String(raw.soundType ?? 'STONE'),
+                    instrument: String(raw.instrument ?? 'HARP'),
+                    destroyTime: Number(raw.destroyTime ?? 1),
+                    explosionResistance: Number(raw.explosionResistance ?? 1),
+                    noCollision: Boolean(raw.noCollision),
+                    noOcclusion: Boolean(raw.noOcclusion),
+                    replaceable: Boolean(raw.replaceable),
+                    randomTicks: Boolean(raw.randomTicks),
+                    requiresCorrectTool: Boolean(raw.requiresCorrectTool),
+                    air: Boolean(raw.air || b.name === 'air' || b.name === 'cave_air' || b.name === 'void_air'),
+                    liquid: Boolean(raw.liquid || b.name === 'water' || b.name === 'lava'),
+                };
+            }
+            this.blocksById[b.rawId] = b;
             this.blockByName.set(b.name, b);
         }
         this.biomesById = biomes;
@@ -376,6 +403,9 @@ export class ClientWorld {
      */
     public generateChunk(chunkX: number, chunkZ: number): ChunkColumn {
         const col = new ChunkColumn(chunkX, chunkZ);
+        if (this.idAir !== 0) {
+            col.blocks.fill(this.idAir);
+        }
         const seaLevel = 63;
         const baseX = chunkX << 4;
         const baseZ = chunkZ << 4;

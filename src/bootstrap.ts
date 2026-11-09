@@ -142,13 +142,13 @@ export class Minecraft263ClientApp {
         this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, noiseRouter);
         this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
 
-        // Load sample .nbt structure template
+        // Load sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
         try {
-            const nbtResp = await fetch('assets/structures/abandoned_camp__campsite_1.nbt');
+            const nbtResp = await fetch('assets/structures/abandoned_camp__camp__dappled_forest__campsite_dappled_forest_1.nbt');
             if (nbtResp.ok) {
                 const nbtBytes = new Uint8Array(await nbtResp.arrayBuffer());
                 const tmpl = await parseStructureTemplateNbt(nbtBytes);
-                this.world.structures.set('abandoned_camp/campsite_1', tmpl);
+                this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', tmpl);
             }
         } catch {}
 

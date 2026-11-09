@@ -120,10 +120,11 @@ export function packRGBA(r: number, g: number, b: number, a = 255): number {
     return ((r & 0xff) | ((g & 0xff) << 8) | ((b & 0xff) << 16) | ((a & 0xff) << 24)) >>> 0;
 }
 
-export function unpackHexToRGBA(hex: number, alpha = 255): number {
-    const r = (hex >>> 16) & 0xff;
-    const g = (hex >>> 8) & 0xff;
-    const b = hex & 0xff;
+export function unpackHexToRGBA(hex: number | string, alpha = 255): number {
+    const num = typeof hex === 'string' ? parseInt(hex.replace('#', ''), 16) || 0xffffff : hex;
+    const r = (num >>> 16) & 0xff;
+    const g = (num >>> 8) & 0xff;
+    const b = num & 0xff;
     return packRGBA(r, g, b, alpha);
 }
 
