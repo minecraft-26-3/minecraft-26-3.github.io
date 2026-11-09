@@ -1,0 +1,16 @@
+{
+  "name": "minecraft-26-3-web",
+  "version": "26.3.0",
+  "description": "Browser-Native 1:1 Port of Minecraft 26.3 (Protocol 777) with WebGPU/WebGL2, WASM Core, and Wispcraft Wisp/Epoxy Networking",
+  "private": true,
+  "scripts": {
+    "extract": "node scripts/extract_26_3.js",
+    "compile-wasm": "node scripts/compile_wasm.js",
+    "build": "node scripts/build.js",
+    "all": "npm run extract && npm run compile-wasm && npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
+  }
+}
