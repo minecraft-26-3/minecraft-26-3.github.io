@@ -198,6 +198,30 @@ export class ClientWorld {
     public isRaining = false;
     private nextEntityId = 100;
 
+    // World Creation & GameRules Configuration (wired to CreateWorldScreen & InWorldGameRulesScreen)
+    public worldType: 'normal' | 'flat' | 'large_biomes' | 'amplified' | 'single_biome_surface' | 'debug_all_block_states' = 'normal';
+    public flatLayers: Array<{ block: string; height: number }> = [
+        { block: 'minecraft:bedrock', height: 1 },
+        { block: 'minecraft:dirt', height: 2 },
+        { block: 'minecraft:grass_block', height: 1 },
+    ];
+    public flatBiome = 'minecraft:plains';
+    public singleBiome = 'minecraft:pale_garden';
+    public generateStructures = true;
+    public bonusChest = false;
+    public gameRules: Record<string, boolean | number> = {
+        advance_time: true,
+        advance_weather: true,
+        spawn_mobs: true,
+        random_tick_speed: 3,
+        keep_inventory: false,
+        fall_damage: true,
+        drowning_damage: true,
+        fire_damage: true,
+        mob_griefing: true,
+        pvp: true,
+    };
+
     // Fast cached IDs for core blocks
     public idAir = 0;
     public idStone = 1;
@@ -241,8 +265,26 @@ export class ClientWorld {
     constructor(
         blocks: BlockRegistryEntry[],
         biomes: BiomeRegistryEntry[],
-        noiseRouter: WorldgenNoiseRouter
+        noiseRouter: WorldgenNoiseRouter,
+        config?: Partial<{
+            worldType: ClientWorld['worldType'];
+            flatLayers: ClientWorld['flatLayers'];
+            flatBiome: string;
+            singleBiome: string;
+            generateStructures: boolean;
+            bonusChest: boolean;
+            gameRules: Record<string, boolean | number>;
+        }>
     ) {
+        if (config) {
+            if (config.worldType) this.worldType = config.worldType;
+            if (config.flatLayers) this.flatLayers = config.flatLayers.map(l => ({ ...l }));
+            if (config.flatBiome) this.flatBiome = config.flatBiome;
+            if (config.singleBiome) this.singleBiome = config.singleBiome;
+            if (config.generateStructures !== undefined) this.generateStructures = config.generateStructures;
+            if (config.bonusChest !== undefined) this.bonusChest = config.bonusChest;
+            if (config.gameRules) this.gameRules = { ...this.gameRules, ...config.gameRules };
+        }
         this.blocksById = new Array(blocks.length);
         for (const b of blocks) {
             const raw = b as unknown as Record<string, unknown>;
@@ -412,6 +454,63 @@ export class ClientWorld {
         const rng = new Xoroshiro128PlusPlus(
             this.noiseRouter.getSeed() ^ (BigInt(chunkX) * 341873128712n + BigInt(chunkZ) * 132897987541n)
         );
+
+        // Superflat World Generator (CreateFlatWorldScreen custom layer stack)
+        if (this.worldType === 'flat') {
+            const flatBiomeClean = this.flatBiome.replace('minecraft:', '');
+            const bEntry = this.biomeByName.get(flatBiomeClean) || this.biomeByName.get('plains') || this.biomesById[0];
+            col.biomes.fill(bEntry ? bEntry.rawId : 0);
+            let curY = CHUNK_MIN_Y;
+            for (const layer of this.flatLayers) {
+                const blkClean = layer.block.replace('minecraft:', '');
+                const blkId = this.blockByName.get(blkClean)?.rawId ?? this.idStone;
+                const h = Math.max(0, Math.min(256, layer.height));
+                for (let dy = 0; dy < h && curY < CHUNK_MAX_Y; dy++, curY++) {
+                    for (let lz = 0; lz < 16; lz++) {
+                        for (let lx = 0; lx < 16; lx++) {
+                            col.setBlock(lx, curY, lz, blkId);
+                            if (blkId === this.idWater || blkId === this.idLava) {
+                                col.setFluidLevel(lx, curY, lz, 8);
+                            }
+                        }
+                    }
+                }
+            }
+            const topY = Math.max(CHUNK_MIN_Y, curY - 1);
+            col.heightmap.fill(topY);
+            if (this.generateStructures && (chunkX & 7) === 2 && (chunkZ & 7) === 2 && this.structures.size > 0) {
+                const structIter = this.structures.values().next();
+                if (!structIter.done && structIter.value) {
+                    this.placeStructureInChunk(col, structIter.value, 2, topY + 1, 2);
+                }
+            }
+            for (let lz = 0; lz < 16; lz++) {
+                for (let lx = 0; lx < 16; lx++) {
+                    this.recalculateColumnLight(col, lx, lz);
+                }
+            }
+            return col;
+        }
+
+        // Debug All Block States Generator
+        if (this.worldType === 'debug_all_block_states') {
+            col.heightmap.fill(70);
+            for (let lz = 0; lz < 16; lz++) {
+                for (let lx = 0; lx < 16; lx++) {
+                    col.setBlock(lx, 60, lz, this.idBedrock);
+                    const wx = baseX + lx;
+                    const wz = baseZ + lz;
+                    if ((wx & 1) === 0 && (wz & 1) === 0 && wx >= 0 && wz >= 0) {
+                        const gridIdx = ((wz >> 1) * 40 + (wx >> 1)) % this.blocksById.length;
+                        const b = this.blocksById[gridIdx];
+                        if (b && !b.properties.air) col.setBlock(lx, 70, lz, b.rawId);
+                    }
+                    this.recalculateColumnLight(col, lx, lz);
+                }
+            }
+            return col;
+        }
+
         const caveNoise = this.noiseRouter.getNoise('minecraft:spaghetti_2d');
         const sulfurNoise = this.noiseRouter.getNoise('minecraft:ore_vein_a');
 
@@ -419,7 +518,15 @@ export class ClientWorld {
             for (let lx = 0; lx < 16; lx++) {
                 const wx = baseX + lx;
                 const wz = baseZ + lz;
-                const { surfaceY, sample } = this.noiseRouter.computeColumnHeight(wx, wz);
+                const sampleX = this.worldType === 'large_biomes' ? Math.floor(wx / 4) : wx;
+                const sampleZ = this.worldType === 'large_biomes' ? Math.floor(wz / 4) : wz;
+                let { surfaceY, sample } = this.noiseRouter.computeColumnHeight(sampleX, sampleZ);
+                if (this.worldType === 'amplified' && surfaceY > seaLevel) {
+                    surfaceY = Math.min(CHUNK_MAX_Y - 12, seaLevel + Math.round((surfaceY - seaLevel) * 2.25));
+                }
+                if (this.worldType === 'single_biome_surface') {
+                    sample = { ...sample, biomeName: this.singleBiome.replace('minecraft:', '') };
+                }
                 col.heightmap[(lz << 4) | lx] = surfaceY;
 
                 const biomeEntry = this.biomeByName.get(sample.biomeName) || this.biomeByName.get('plains') || this.biomesById[0];
@@ -545,8 +652,20 @@ export class ClientWorld {
             }
         }
 
+        // Place Bonus Chest at spawn chunk (0, 0) if Bonus Chest option is enabled
+        if (this.bonusChest && chunkX === 0 && chunkZ === 0) {
+            const bx = 7, bz = 6;
+            const by = col.heightmap[(bz << 4) | bx] + 1;
+            col.setBlock(bx, by, bz, this.idChest);
+            this.blockEntities.set(BlockPos.asLong(bx, by, bz), { x: bx, y: by, z: bz, type: 'chest', openProgress: 0 });
+            col.setBlock(bx - 1, by, bz, this.idTorch);
+            col.setBlock(bx + 1, by, bz, this.idTorch);
+            col.setBlock(bx, by, bz - 1, this.idTorch);
+            col.setBlock(bx, by, bz + 1, this.idTorch);
+        }
+
         // Place authentic .nbt structure template on landmark chunks (e.g., abandoned_camp or plains house)
-        if (((chunkX & 7) === 2 && (chunkZ & 7) === 2) && this.structures.size > 0) {
+        if (this.generateStructures && ((chunkX & 7) === 2 && (chunkZ & 7) === 2) && this.structures.size > 0) {
             const structIter = this.structures.values().next();
             if (!structIter.done && structIter.value) {
                 this.placeStructureInChunk(col, structIter.value, 2, col.heightmap[(2 << 4) | 2] + 1, 2);
@@ -561,7 +680,7 @@ export class ClientWorld {
         }
 
         // Spawn passive mobs and Minecraft 26.3's Sulfur Cube entity
-        if (this.entities.size < 28 && rng.nextInt(3) === 0) {
+        if (this.gameRules.spawn_mobs !== false && this.entities.size < 28 && rng.nextInt(3) === 0) {
             const sx = baseX + 8;
             const sz = baseZ + 8;
             const sy = col.heightmap[(8 << 4) | 8] + 1;

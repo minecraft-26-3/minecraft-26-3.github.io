@@ -3,12 +3,13 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Minecraft 26.3 (Protocol 777, DataVersion 5023) — Browser Port</title>
+    <title>Minecraft 26.3</title>
     <style>
         * {
             box-sizing: border-box;
             user-select: none;
             -webkit-user-select: none;
+            image-rendering: pixelated;
         }
         html, body {
             margin: 0;
@@ -16,11 +17,16 @@
             width: 100%;
             height: 100%;
             overflow: hidden;
-            background: #141619;
+            background: #000000;
             font-family: "Courier New", Courier, monospace;
             color: #ffffff;
+            text-shadow: 2px 2px 0px #202020;
         }
-        #game-canvas-3d, #game-canvas-gui {
+
+        /* Layered Canvas Stack */
+        #game-canvas-3d,
+        #game-canvas-gui,
+        #gui-bg-canvas {
             position: absolute;
             top: 0;
             left: 0;
@@ -29,127 +35,453 @@
             display: block;
             image-rendering: pixelated;
         }
+        #game-canvas-3d {
+            z-index: 1;
+        }
         #game-canvas-gui {
             z-index: 2;
             cursor: crosshair;
         }
-        /* Top right quick control bar */
-        #top-toolbar {
-            position: absolute;
-            top: 10px;
-            right: 12px;
+        #gui-bg-canvas {
             z-index: 10;
+            pointer-events: none;
+        }
+
+        /* Authentic Vanilla GUI Root (`net.minecraft.client.gui.screens.*`) */
+        #vanilla-gui-root {
+            position: absolute;
+            inset: 0;
+            z-index: 20;
             display: flex;
-            gap: 8px;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            pointer-events: auto;
+            overflow: hidden;
         }
-        .mc-btn {
-            background: #585858;
+
+        /* Authentic Mojang Button Sprite (`assets/gui/button.png`, `button_highlighted.png`, `button_disabled.png`) */
+        .mc-widget-btn {
+            position: relative;
+            height: 40px;
+            background-image: url('assets/gui/button.png');
+            background-size: 100% 100%;
+            background-repeat: no-repeat;
+            background-color: #6f6f6f;
+            border: 2px solid #000000;
+            box-shadow: inset 2px 2px 0px rgba(255, 255, 255, 0.35), inset -2px -2px 0px rgba(0, 0, 0, 0.45);
             color: #ffffff;
-            border: 2px solid #1e1e1e;
-            box-shadow: inset 2px 2px 0px #969696, inset -2px -2px 0px #383838;
-            padding: 6px 12px;
-            font-family: "Courier New", monospace;
+            font-family: "Courier New", Courier, monospace;
             font-weight: bold;
-            font-size: 13px;
+            font-size: 14px;
+            text-shadow: 2px 2px 0px #202020;
             cursor: pointer;
-            text-shadow: 1px 1px 0 #1b1b1b;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 10px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        .mc-btn:hover {
-            background: #6d7594;
+        .mc-widget-btn:hover:not(:disabled) {
+            background-image: url('assets/gui/button_highlighted.png');
+            border-color: #ffffff;
             color: #ffffa0;
         }
-        /* Mojang / 26.3 Initialization Overlay */
-        #loading-overlay {
-            position: fixed;
-            inset: 0;
-            background: #ef323d;
-            z-index: 100;
-            display: flex;
-            flex-direction: column;
+        .mc-widget-btn:disabled,
+        .mc-widget-btn-disabled {
+            background-image: url('assets/gui/button_disabled.png');
+            color: #a0a0a0;
+            cursor: default;
+            border-color: #000000;
+        }
+        .mc-icon-btn,
+        .mc-widget-icon-btn {
+            padding: 0;
+            width: 40px;
+            height: 40px;
+            flex-shrink: 0;
+        }
+        .mc-icon-btn img,
+        .mc-btn-icon {
+            width: 24px;
+            height: 24px;
+            image-rendering: pixelated;
+            pointer-events: none;
+        }
+
+        /* Authentic Mojang Slider Widget (`assets/gui/slider.png` + `slider_handle.png`) */
+        .mc-slider-wrap {
+            position: relative;
+            height: 40px;
+            background-image: url('assets/gui/slider.png');
+            background-size: 100% 100%;
+            background-color: #2c2c2c;
+            border: 2px solid #000000;
+            display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 18px;
+            overflow: hidden;
         }
-        #loading-title {
-            font-size: 36px;
-            font-weight: 900;
-            letter-spacing: 3px;
-            text-shadow: 3px 3px 0px rgba(0, 0, 0, 0.35);
+        .mc-slider-wrap:hover {
+            border-color: #ffffff;
         }
-        #loading-subtitle {
-            font-size: 15px;
-            opacity: 0.92;
-        }
-        #loading-bar-frame {
-            width: min(520px, 82vw);
-            height: 22px;
-            border: 3px solid #ffffff;
-            padding: 3px;
-            background: rgba(0, 0, 0, 0.2);
-        }
-        #loading-bar-fill {
-            width: 5%;
+        .mc-slider-input {
+            position: absolute;
+            inset: 0;
+            width: 100%;
             height: 100%;
-            background: #ffffff;
-            transition: width 0.15s ease-out;
+            opacity: 0;
+            cursor: ew-resize;
+            z-index: 3;
+            margin: 0;
         }
-        #loading-status {
+        .mc-slider-handle {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 16px;
+            background-image: url('assets/gui/slider_handle.png');
+            background-size: 100% 100%;
+            background-color: #888888;
+            border-left: 2px solid #dcdcdc;
+            border-right: 2px solid #383838;
+            pointer-events: none;
+            z-index: 1;
+        }
+        .mc-slider-wrap:hover .mc-slider-handle {
+            background-image: url('assets/gui/slider_handle_highlighted.png');
+        }
+        .mc-slider-label {
+            position: relative;
+            z-index: 2;
+            font-size: 13px;
+            font-weight: bold;
+            color: #ffffff;
+            text-shadow: 2px 2px 0px #181818;
+            pointer-events: none;
+            padding: 0 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Authentic Text Box (`EditBox`) */
+        .mc-text-field,
+        .mc-text-input {
+            height: 36px;
+            background: #000000;
+            color: #ffffff;
+            border: 2px solid #a0a0a0;
+            padding: 6px 10px;
+            font-family: "Courier New", Courier, monospace;
             font-size: 14px;
-            color: #fff8f8;
+            font-weight: bold;
+            outline: none;
         }
-        /* Modal Windows (Creative Registry Browser & Wispcraft Multiplayer) */
-        .mc-modal-backdrop {
-            position: fixed;
-            inset: 0;
-            background: rgba(10, 12, 16, 0.72);
-            z-index: 30;
-            display: none;
-            align-items: center;
-            justify-content: center;
+        .mc-text-field:focus,
+        .mc-text-input:focus {
+            border-color: #ffffff;
         }
-        .mc-modal {
-            width: min(820px, 92vw);
-            max-height: 84vh;
-            background: #c6c6c6;
-            color: #202020;
-            border: 3px solid #111111;
-            box-shadow: inset 3px 3px 0 #ffffff, inset -3px -3px 0 #555555;
-            padding: 16px;
+
+        /* Title Screen Layout (`net.minecraft.client.gui.screens.TitleScreen`) */
+        .mc-title-screen {
+            position: relative;
+            width: 100%;
+            height: 100%;
             display: flex;
             flex-direction: column;
-            gap: 12px;
-        }
-        .mc-modal-header {
-            display: flex;
-            justify-content: space-between;
             align-items: center;
+            justify-content: center;
+            gap: 28px;
+            padding: 24px;
+        }
+        .mc-title-logo-box,
+        .mc-title-logo-area {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .mc-title-logo-img {
+            width: min(548px, 78vw);
+            height: auto;
+            image-rendering: pixelated;
+            filter: drop-shadow(0 4px 0 rgba(0, 0, 0, 0.45));
+        }
+        .mc-title-edition-img {
+            width: min(196px, 34vw);
+            height: auto;
+            margin-top: -10px;
+            image-rendering: pixelated;
+        }
+        .mc-title-splash,
+        .mc-splash-label {
+            position: absolute;
+            right: -36px;
+            bottom: 8px;
+            color: #ffff00;
             font-weight: bold;
             font-size: 18px;
-            border-bottom: 2px solid #777777;
-            padding-bottom: 8px;
+            text-shadow: 2px 2px 0px #3f3f00;
+            white-space: nowrap;
+            pointer-events: none;
+            transform-origin: center center;
         }
-        .mc-input {
-            background: #101010;
-            color: #ffffff;
-            border: 2px solid #8b8b8b;
-            padding: 8px 10px;
-            font-family: "Courier New", monospace;
+        .mc-title-buttons,
+        .mc-title-menu {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        .mc-title-bottom-row,
+        .mc-btn-row,
+        .mc-footer-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .mc-form-stack {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+        .mc-title-corner-left {
+            position: absolute;
+            left: 10px;
+            bottom: 8px;
             font-size: 14px;
-            width: 100%;
-        }
-        #inv-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(115px, 1fr));
-            gap: 6px;
-            overflow-y: auto;
-            max-height: 55vh;
-            background: #8b8b8b;
-            padding: 8px;
-            border: 2px inset #555555;
-        }
-        .inv-cell {
-            background: #545454;
             color: #ffffff;
+        }
+        .mc-title-corner-right {
+            position: absolute;
+            right: 10px;
+            bottom: 8px;
+            font-size: 14px;
+            color: #ffffff;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .mc-title-corner-right:hover {
+            color: #ffffa0;
+        }
+
+        /* Standard Screen Frame (Header / Body / Footer with menu_background.png & separators) */
+        .mc-screen-frame {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .mc-menu-bg {
+            background-image: url('assets/gui/menu_background.png');
+            background-repeat: repeat;
+            background-size: 64px 64px;
+            background-color: rgba(16, 16, 16, 0.72);
+            background-blend-mode: multiply;
+        }
+        .mc-inworld-bg {
+            background: rgba(16, 16, 20, 0.68);
+        }
+        .mc-screen-header {
+            width: 100%;
+            min-height: 54px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 16px 8px 16px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.22);
+            background: rgba(0, 0, 0, 0.42);
+            gap: 4px;
+        }
+        .mc-screen-title {
+            font-size: 19px;
+            font-weight: bold;
+        }
+        .mc-bytecode-badge {
+            font-size: 11px;
+            color: #9e9e9e;
+        }
+        .mc-screen-body {
+            flex: 1;
+            width: 100%;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 14px 20px;
+        }
+        .mc-screen-footer {
+            width: 100%;
+            min-height: 62px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px 16px;
+            border-top: 2px solid rgba(255, 255, 255, 0.22);
+            background: rgba(0, 0, 0, 0.42);
+        }
+
+        /* CreateWorldScreen Top Tab Bar (`Game`, `World`, `More`) */
+        .mc-tab-bar {
+            display: flex;
+            gap: 4px;
+            align-items: flex-end;
+            margin-top: 6px;
+        }
+        .mc-tab-btn {
+            height: 36px;
+            min-width: 140px;
+            padding: 0 18px;
+            background-image: url('assets/gui/tab.png');
+            background-size: 100% 100%;
+            background-color: #3b3b3b;
+            border: 2px solid #000000;
+            color: #d0d0d0;
+            font-family: "Courier New", Courier, monospace;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            text-shadow: 2px 2px 0px #181818;
+        }
+        .mc-tab-btn.active {
+            background-image: url('assets/gui/tab_selected.png');
+            background-color: #6a6a6a;
+            color: #ffffff;
+            border-bottom-color: transparent;
+        }
+        .mc-tab-btn:hover {
+            color: #ffffa0;
+        }
+
+        /* 2-Column Options Grid */
+        .mc-options-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 150px);
+            gap: 8px 10px;
+            justify-content: center;
+            align-content: start;
+        }
+
+        /* Scrollable Selection Lists (World List, Language List, Keybinds, Game Rules, Biomes, Presets) */
+        .mc-scroll-list {
+            width: min(680px, 94vw);
+            flex: 1;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.58);
+            border: 2px solid #000000;
+            box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.85);
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .mc-list-row,
+        .mc-list-entry {
+            padding: 8px 12px;
+            border: 2px solid transparent;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .mc-list-row:hover,
+        .mc-list-entry:hover {
+            background: rgba(255, 255, 255, 0.10);
+        }
+        .mc-list-row.selected,
+        .mc-list-entry.selected {
+            border-color: #ffffff;
+            background: rgba(0, 0, 0, 0.78);
+        }
+        .mc-list-category {
+            text-align: center;
+            font-weight: bold;
+            color: #ffff55;
+            padding: 8px 0 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+        }
+
+        /* World List Entry (`WorldSelectionList.WorldListEntry`) */
+        .mc-world-entry {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 10px;
+            border: 2px solid transparent;
+            cursor: pointer;
+        }
+        .mc-world-entry.selected {
+            border-color: #ffffff;
+            background: rgba(0, 0, 0, 0.78);
+        }
+        .mc-world-icon {
+            width: 64px;
+            height: 64px;
+            border: 2px solid #383838;
+            flex-shrink: 0;
+        }
+        .mc-world-info,
+        .mc-world-details {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            overflow: hidden;
+        }
+        .mc-world-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        .mc-world-sub,
+        .mc-world-meta {
+            font-size: 12px;
+            color: #a8a8a8;
+        }
+
+        /* Dual-Column Resource / Data Pack Selection Screen (`PackSelectionScreen`) */
+        .mc-dual-lists {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(260px, 320px));
+            gap: 14px;
+            width: min(680px, 95vw);
+            flex: 1;
+            min-height: 240px;
+        }
+        .mc-pack-col {
+            display: flex;
+            flex-direction: column;
+            background: rgba(0, 0, 0, 0.58);
+            border: 2px solid #000000;
+            padding: 8px;
+            overflow-y: auto;
+            gap: 6px;
+        }
+
+        /* Creative Inventory Grid (`CreativeModeInventoryScreen`) */
+        .mc-creative-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(105px, 1fr));
+            gap: 6px;
+            width: min(740px, 94vw);
+            overflow-y: auto;
+            flex: 1;
+            background: rgba(0, 0, 0, 0.62);
+            padding: 8px;
+            border: 2px solid #000000;
+        }
+        .mc-creative-cell {
+            background: #545454;
             border: 2px solid #373737;
             padding: 6px;
             display: flex;
@@ -160,88 +492,30 @@
             font-size: 11px;
             text-align: center;
         }
-        .inv-cell:hover {
+        .mc-creative-cell:hover {
             background: #77829e;
             border-color: #ffffff;
         }
-        .inv-icon {
+        .mc-creative-icon {
             width: 32px;
             height: 32px;
             image-rendering: pixelated;
             background-repeat: no-repeat;
         }
-        #mp-status-log {
-            background: #141418;
-            color: #7efc20;
-            padding: 10px;
-            font-size: 13px;
-            border: 2px inset #555555;
-            min-height: 62px;
-            white-space: pre-wrap;
-        }
     </style>
 </head>
 <body>
-    <!-- Initialization Progress Screen -->
-    <div id="loading-overlay">
-        <div id="loading-title">MOJANG STUDIOS</div>
-        <div id="loading-subtitle">Minecraft 26.3 • Protocol 777 • DataVersion 5023 • WebGPU / WebGL2</div>
-        <div id="loading-bar-frame">
-            <div id="loading-bar-fill"></div>
-        </div>
-        <div id="loading-status">Initializing JVM-to-WASM runtime...</div>
-    </div>
-
-    <!-- Dual Canvas Stack: 3D WebGPU/WebGL2 + 2D GUI/HUD Overlay -->
+    <!-- 3D WebGPU / WebGL2 World Canvas -->
     <canvas id="game-canvas-3d"></canvas>
+
+    <!-- 2D In-Game HUD & Crosshair Canvas -->
     <canvas id="game-canvas-gui"></canvas>
 
-    <!-- Top Right Controls -->
-    <div id="top-toolbar">
-        <button id="btn-toggle-backend" class="mc-btn" title="Switch between WebGPU and WebGL2">Backend: WebGPU</button>
-        <button id="btn-open-inventory" class="mc-btn" title="Open 26.3 Registry Browser (Key: E)">Blocks &amp; Items [E]</button>
-        <button id="btn-open-multiplayer" class="mc-btn" title="Wispcraft Wisp/Epoxy Multiplayer &amp; Microsoft Auth (Key: M)">Multiplayer / Auth [M]</button>
-    </div>
+    <!-- 2D Panorama / Dirt Background / SplashOverlay Canvas -->
+    <canvas id="gui-bg-canvas"></canvas>
 
-    <!-- Creative Registry Browser Modal (1,288 Blocks & 1,253 Items) -->
-    <div id="inventory-modal" class="mc-modal-backdrop">
-        <div class="mc-modal">
-            <div class="mc-modal-header">
-                <span>Minecraft 26.3 Registry Browser (1,288 Blocks • Click to equip in active Hotbar slot)</span>
-                <button id="btn-close-inventory" class="mc-btn">Close [Esc]</button>
-            </div>
-            <input id="inv-search-input" class="mc-input" type="text" placeholder="Search 26.3 blocks (e.g. sulfur, pale_oak, cherry, diamond, deepslate)..." />
-            <div id="inv-grid"></div>
-        </div>
-    </div>
-
-    <!-- Wispcraft Wisp/Epoxy Multiplayer & Microsoft OAuth2 Modal -->
-    <div id="multiplayer-modal" class="mc-modal-backdrop">
-        <div class="mc-modal">
-            <div class="mc-modal-header">
-                <span>Wispcraft Multiplayer (Protocol 777 • Wisp/Epoxy Proxy &amp; Microsoft OAuth 2.0)</span>
-                <button id="btn-close-multiplayer" class="mc-btn">Close [Esc]</button>
-            </div>
-            <label style="font-size:13px;font-weight:bold;">Wisp Proxy Server (WebSocket TCP/UDP Multiplexer):</label>
-            <input id="mp-wisp-url" class="mc-input" type="text" value="wss://anura.pro/" />
-
-            <label style="font-size:13px;font-weight:bold;">Minecraft 26.3 Server Address (Host:Port or SRV Domain):</label>
-            <input id="mp-server-addr" class="mc-input" type="text" value="mc.hypixel.net:25565" />
-
-            <label style="font-size:13px;font-weight:bold;">Player Username (or Authenticate with Microsoft):</label>
-            <div style="display:flex;gap:8px;">
-                <input id="mp-username" class="mc-input" type="text" value="Player26_3" />
-                <button id="btn-msa-login" class="mc-btn" style="white-space:nowrap;">Microsoft OAuth2 Device Code</button>
-            </div>
-
-            <div style="display:flex;gap:8px;">
-                <button id="btn-mp-ping" class="mc-btn">Ping Server Status (0x00)</button>
-                <button id="btn-mp-connect" class="mc-btn">Connect to Server (Protocol 777)</button>
-            </div>
-
-            <div id="mp-status-log">Ready. Uses epoxy.wasm + Wisp protocol (CONNECT 0x01 / DATA 0x02 / CONTINUE 0x03 / CLOSE 0x04), RSA PKCS#1 v1.5, AES/CFB8, and Zlib framing.</div>
-        </div>
-    </div>
+    <!-- Authentic Vanilla Screen Hierarchy Root (`net.minecraft.client.gui.screens.*`) -->
+    <div id="vanilla-gui-root"></div>
 
     <script src="bootstrap.js"></script>
 </body>

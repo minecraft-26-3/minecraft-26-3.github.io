@@ -195,9 +195,21 @@ export class DualRenderEngine {
     private atlasCtx: CanvasRenderingContext2D | null = null;
     private lightmapPixels = new Uint8Array(16 * 16 * 4);
     private lastLightmapSun = -1;
+    private lastLightmapGamma = -1;
     public renderedChunksCount = 0;
     public culledChunksCount = 0;
     public totalGpuVertices = 0;
+
+    // Live Video & Skin Settings (wired to VideoSettingsScreen & SkinCustomizationScreen)
+    public gamma = 0.5; // 0.0 (Moody) .. 1.0 (Bright)
+    public cloudMode: 'off' | 'fast' | 'fancy' = 'fancy';
+    public cloudHeight = 148;
+    public particlesMode: 'all' | 'decreased' | 'minimal' = 'all';
+    public entityDistanceScaling = 1.0; // 0.5 (50%) .. 5.0 (500%)
+    public entityShadows = true;
+    public guiScale = 0; // 0 = Auto, 1..4 = fixed scale
+    public mainHand: 'right' | 'left' = 'right';
+    public attackIndicator: 'crosshair' | 'hotbar' | 'off' = 'crosshair';
 
     constructor(canvas3D: HTMLCanvasElement, canvasGui: HTMLCanvasElement) {
         this.canvas3D = canvas3D;
@@ -524,15 +536,18 @@ export class DualRenderEngine {
      * Recomputes the 16x16 dynamic Sky/Block Lightmap (`lightmap.fsh` formula) when time-of-day sunlight changes.
      */
     private updateLightmapPixels(sunBrightness: number): void {
-        if (Math.abs(sunBrightness - this.lastLightmapSun) < 0.01) return;
+        if (Math.abs(sunBrightness - this.lastLightmapSun) < 0.01 && Math.abs(this.gamma - this.lastLightmapGamma) < 0.01) return;
         this.lastLightmapSun = sunBrightness;
+        this.lastLightmapGamma = this.gamma;
+        const gammaExp = Math.max(0.45, 1.55 - this.gamma * 0.9);
+        const ambientFloor = 0.05 + this.gamma * 0.14;
 
         for (let skyIdx = 0; skyIdx < 16; skyIdx++) {
             const skyNorm = (skyIdx / 15.0) * sunBrightness;
-            const skyCurve = Math.pow(skyNorm, 1.35) * 0.92 + 0.08;
+            const skyCurve = Math.pow(skyNorm, gammaExp) * (1.0 - ambientFloor) + ambientFloor;
             for (let blkIdx = 0; blkIdx < 16; blkIdx++) {
                 const blkNorm = blkIdx / 15.0;
-                const blkCurve = Math.pow(blkNorm, 1.25);
+                const blkCurve = Math.pow(blkNorm, gammaExp * 0.92);
 
                 // Warm torchlight tint for blockLight + cool daylight/moonlight for skyLight
                 const r = Math.min(255, Math.round(Math.max(skyCurve, blkCurve * 1.05) * 255));
@@ -623,13 +638,32 @@ export class DualRenderEngine {
         this.chunkSlots.set(key, slot);
     }
 
+    public clearChunkMeshes(): void {
+        for (const existing of this.chunkSlots.values()) {
+            existing.wgpuOpaque?.destroy();
+            existing.wgpuCutout?.destroy();
+            existing.wgpuTranslucent?.destroy();
+            if (this.gl) {
+                if (existing.glOpaqueVao) this.gl.deleteVertexArray(existing.glOpaqueVao);
+                if (existing.glOpaqueVbo) this.gl.deleteBuffer(existing.glOpaqueVbo);
+                if (existing.glCutoutVao) this.gl.deleteVertexArray(existing.glCutoutVao);
+                if (existing.glCutoutVbo) this.gl.deleteBuffer(existing.glCutoutVbo);
+                if (existing.glTranslucentVao) this.gl.deleteVertexArray(existing.glTranslucentVao);
+                if (existing.glTranslucentVbo) this.gl.deleteBuffer(existing.glTranslucentVbo);
+            }
+        }
+        this.chunkSlots.clear();
+    }
+
     /**
      * Spawns 3D block-break debris or environmental particles (`sulfur_bubbles`, `flame`, `rain`).
      */
     public spawnBlockBreakParticles(x: number, y: number, z: number, uv: AtlasUVEntry, tint = 0xffffffff): void {
-        for (let ix = 0; ix < 3; ix++) {
-            for (let iy = 0; iy < 3; iy++) {
-                for (let iz = 0; iz < 3; iz++) {
+        if (this.particlesMode === 'minimal') return;
+        const step = this.particlesMode === 'decreased' ? 2 : 1;
+        for (let ix = 0; ix < 3; ix += step) {
+            for (let iy = 0; iy < 3; iy += step) {
+                for (let iz = 0; iz < 3; iz += step) {
                     const px = x + (ix + 0.5) / 3;
                     const py = y + (iy + 0.5) / 3;
                     const pz = z + (iz + 0.5) / 3;
@@ -704,30 +738,38 @@ export class DualRenderEngine {
         const my = camY - Math.sin(sunAngleRad) * skyRadius;
         this.emitBox(dyn, mx - 5, my - 5, sz - 5, mx + 5, my + 5, sz + 5, moonUv, fullBright, packRGBA(210, 225, 255, 255));
 
-        // Pass 7B: 3D Volumetric Cloud Layer at Y = 148
-        const snowUv = mesher.getUV('snow');
-        const cloudDrift = (Number(world.worldAgeTicks) + partialTick) * 0.03;
-        const cloudLight = packLightAndAO(12, 15, 0.95);
-        const cloudColor = packRGBA(248, 250, 255, 220);
-        const baseCloudX = Math.floor((camX + cloudDrift) / 24) * 24;
-        const baseCloudZ = Math.floor(camZ / 24) * 24;
-        for (let cx = -3; cx <= 3; cx++) {
-            for (let cz = -3; cz <= 3; cz++) {
-                const wx = baseCloudX + cx * 24 - (cloudDrift % 24);
-                const wz = baseCloudZ + cz * 24;
-                const hash = ((Math.floor((wx + cloudDrift) / 24) * 73856093) ^ (Math.floor(wz / 24) * 19349663)) & 7;
-                if (hash < 3) {
-                    this.emitBox(dyn, wx, 148, wz, wx + 18, 151.5, wz + 14, snowUv, cloudLight, cloudColor);
+        // Pass 7B: 3D Volumetric Cloud Layer (controlled by VideoSettingsScreen Clouds & Cloud Height)
+        if (this.cloudMode !== 'off') {
+            const snowUv = mesher.getUV('snow');
+            const cloudDrift = (Number(world.worldAgeTicks) + partialTick) * 0.03;
+            const cloudLight = packLightAndAO(12, 15, 0.95);
+            const cloudColor = packRGBA(248, 250, 255, 220);
+            const baseCloudX = Math.floor((camX + cloudDrift) / 24) * 24;
+            const baseCloudZ = Math.floor(camZ / 24) * 24;
+            const cThick = this.cloudMode === 'fancy' ? 3.5 : 0.25;
+            for (let cx = -3; cx <= 3; cx++) {
+                for (let cz = -3; cz <= 3; cz++) {
+                    const wx = baseCloudX + cx * 24 - (cloudDrift % 24);
+                    const wz = baseCloudZ + cz * 24;
+                    const hash = ((Math.floor((wx + cloudDrift) / 24) * 73856093) ^ (Math.floor(wz / 24) * 19349663)) & 7;
+                    if (hash < 3) {
+                        this.emitBox(dyn, wx, this.cloudHeight, wz, wx + 18, this.cloudHeight + cThick, wz + 14, snowUv, cloudLight, cloudColor);
+                    }
                 }
             }
         }
 
         // Pass 4: Entity Models (Sulfur Cube, Passive & Hostile Mobs with partialTick interpolation)
+        const maxEntDist = 64.0 * this.entityDistanceScaling;
+        const shadowUv = mesher.getUV('obsidian');
         for (const ent of world.entities.values()) {
             const ex = ent.prevX + (ent.x - ent.prevX) * partialTick;
             const ey = ent.prevY + (ent.y - ent.prevY) * partialTick;
             const ez = ent.prevZ + (ent.z - ent.prevZ) * partialTick;
-            if (Math.hypot(ex - camX, ez - camZ) > 64) continue;
+            if (Math.hypot(ex - camX, ez - camZ) > maxEntDist) continue;
+            if (this.entityShadows) {
+                this.emitBox(dyn, ex - 0.28, ey + 0.01, ez - 0.28, ex + 0.28, ey + 0.03, ez + 0.28, shadowUv, fullBright, packRGBA(15, 15, 15, 140));
+            }
 
             const entLight = packLightAndAO(4, 15, 1.0);
             const hurtTint = ent.hurtTime > 0 ? packRGBA(255, 110, 110, 255) : 0xffffffff;
@@ -1156,23 +1198,28 @@ export class DualRenderEngine {
         workerStatus: string;
         wispUrl: string;
         profileName: string;
+        hideGui?: boolean;
+        gameMode?: 'survival' | 'hardcore' | 'creative';
+        subtitles?: Array<{ text: string; dir: string }>;
     }): void {
         const ctx = this.guiCtx;
         const w = this.canvasGui.width;
         const h = this.canvasGui.height;
         ctx.clearRect(0, 0, w, h);
+        if (params.hideGui) return;
 
-        // 1. Render First-Person Right-Hand Held Block in bottom-right corner with swing animation
+        // 1. Render First-Person Held Block in bottom-right (or bottom-left if Main Hand: Left) with swing animation
         const heldBlock = params.hotbarBlocks[params.selectedHotbarSlot];
         if (heldBlock && this.blockAtlasImg) {
             const swingSin = Math.sin(params.swingProgress * Math.PI);
-            const handX = w - 210 - swingSin * 45;
+            const isLeft = this.mainHand === 'left';
+            const handX = isLeft ? (82 + swingSin * 45) : (w - 210 - swingSin * 45);
             const handY = h - 180 + Math.abs(swingSin) * 35;
             const uv = params.blockUvs[heldBlock.textures.north] || params.blockUvs[heldBlock.textures.up];
             if (uv) {
                 ctx.save();
                 ctx.translate(handX, handY);
-                ctx.rotate(-0.18 - swingSin * 0.45);
+                ctx.rotate(isLeft ? (0.18 + swingSin * 0.45) : (-0.18 - swingSin * 0.45));
                 ctx.drawImage(this.blockAtlasImg, uv.x, uv.y, uv.w, uv.h, 0, 0, 128, 128);
                 ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
                 ctx.fillRect(0, 0, 128, 128);
@@ -1180,48 +1227,54 @@ export class DualRenderEngine {
             }
         }
 
-        // 2. Crosshair (Inverted-style crisp pixel crosshair)
+        // 2. Crosshair (Inverted-style crisp pixel crosshair + optional Attack Indicator)
         const cx = Math.floor(w / 2);
         const cy = Math.floor(h / 2);
         ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
         ctx.fillRect(cx - 8, cy - 1, 16, 2);
         ctx.fillRect(cx - 1, cy - 8, 2, 16);
+        if (this.attackIndicator === 'crosshair' && params.swingProgress > 0) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+            ctx.fillRect(cx - 8, cy + 12, Math.floor(16 * (1.0 - params.swingProgress)), 3);
+        }
 
-        // 3. Survival Hearts, Hunger Drumsticks & Experience Bar above Hotbar
-        const scale = 3;
+        // 3. Survival/Hardcore Hearts, Hunger Drumsticks & Experience Bar above Hotbar
+        const scale = this.guiScale > 0 ? Math.max(2, Math.min(4, this.guiScale)) : 3;
         const hotbarW = 182 * scale;
         const hotbarH = 22 * scale;
         const hotbarX = Math.floor((w - hotbarW) / 2);
         const hotbarY = h - hotbarH - 12;
 
-        // Hearts (10 hearts = 20 HP)
-        for (let i = 0; i < 10; i++) {
-            const hx = hotbarX + i * 24;
-            const hy = hotbarY - 34;
-            ctx.fillStyle = '#000000';
-            ctx.fillRect(hx, hy, 20, 20);
-            ctx.fillStyle = (i * 2 + 1) <= params.health ? '#e52521' : '#3a1010';
-            ctx.fillRect(hx + 2, hy + 2, 16, 16);
-            ctx.fillStyle = '#ff7b79';
-            ctx.fillRect(hx + 4, hy + 4, 4, 4);
-        }
+        if (params.gameMode !== 'creative') {
+            // Hearts (10 hearts = 20 HP, with Hardcore eyebrow marks if hardcore)
+            for (let i = 0; i < 10; i++) {
+                const hx = hotbarX + i * 24;
+                const hy = hotbarY - 34;
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(hx, hy, 20, 20);
+                ctx.fillStyle = (i * 2 + 1) <= params.health ? (params.gameMode === 'hardcore' ? '#c81010' : '#e52521') : '#3a1010';
+                ctx.fillRect(hx + 2, hy + 2, 16, 16);
+                ctx.fillStyle = '#ff7b79';
+                ctx.fillRect(hx + 4, hy + 4, 4, 4);
+            }
 
-        // Hunger bar (10 icons on right)
-        for (let i = 0; i < 10; i++) {
-            const fx = hotbarX + hotbarW - (i + 1) * 24 + 4;
-            const fy = hotbarY - 34;
-            ctx.fillStyle = '#000000';
-            ctx.fillRect(fx, fy, 20, 20);
-            ctx.fillStyle = (i * 2 + 1) <= params.hunger ? '#c67d30' : '#2e1d0c';
-            ctx.fillRect(fx + 2, fy + 2, 16, 16);
-        }
+            // Hunger bar (10 icons on right)
+            for (let i = 0; i < 10; i++) {
+                const fx = hotbarX + hotbarW - (i + 1) * 24 + 4;
+                const fy = hotbarY - 34;
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(fx, fy, 20, 20);
+                ctx.fillStyle = (i * 2 + 1) <= params.hunger ? '#c67d30' : '#2e1d0c';
+                ctx.fillRect(fx + 2, fy + 2, 16, 16);
+            }
 
-        // Experience bar
-        ctx.fillStyle = '#111111';
-        ctx.fillRect(hotbarX, hotbarY - 11, hotbarW, 7);
-        ctx.fillStyle = '#7efc20';
-        ctx.fillRect(hotbarX + 1, hotbarY - 10, Math.floor((hotbarW - 2) * 0.65), 5);
-        this.drawShadowedText(String(params.xpLevel), cx - 6, hotbarY - 14, '#80ff20', 16);
+            // Experience bar
+            ctx.fillStyle = '#111111';
+            ctx.fillRect(hotbarX, hotbarY - 11, hotbarW, 7);
+            ctx.fillStyle = '#7efc20';
+            ctx.fillRect(hotbarX + 1, hotbarY - 10, Math.floor((hotbarW - 2) * 0.65), 5);
+            this.drawShadowedText(String(params.xpLevel), cx - 6, hotbarY - 14, '#80ff20', 16);
+        }
 
         // 4. 9-Slot Hotbar
         ctx.fillStyle = 'rgba(20, 20, 24, 0.85)';
@@ -1258,12 +1311,26 @@ export class DualRenderEngine {
             this.drawShadowedText(label, cx - label.length * 4.5, hotbarY - 56, '#ffffff', 16);
         }
 
-        // 5. F3 Debug Screen (`Minecraft 26.3 (26.3/vanilla)`)
+        // 5. Directional Audio Subtitles Box (bottom-right above hotbar when Show Subtitles: ON)
+        if (params.subtitles && params.subtitles.length > 0) {
+            let sy = h - 110;
+            for (const sub of params.subtitles) {
+                const label = `${sub.dir === '<' ? '< ' : '  '}${sub.text}${sub.dir === '>' ? ' >' : '  '}`;
+                const boxW = Math.max(160, label.length * 9 + 18);
+                const bx = w - boxW - 16;
+                ctx.fillStyle = 'rgba(16, 16, 20, 0.78)';
+                ctx.fillRect(bx, sy, boxW, 24);
+                this.drawShadowedText(label, bx + 9, sy + 17, '#ffffff', 14);
+                sy -= 26;
+            }
+        }
+
+        // 6. F3 Debug Screen (`Minecraft 26.3 (26.3/vanilla)`)
         if (params.showF3Debug) {
             const leftLines = [
                 `Minecraft 26.3 (26.3/vanilla - Protocol 777, DataVersion 5023)`,
                 `${params.fps} fps | Backend: ${this.backend} | C: ${this.renderedChunksCount}/${this.renderedChunksCount + this.culledChunksCount} (F: ${this.culledChunksCount}) | V: ${this.totalGpuVertices}`,
-                `Thr: ${params.workerStatus} | WASM: mc26_3_core.wasm + epoxy.wasm`,
+                `Thr: ${params.workerStatus} | WASM: mc26_3_core.wasm + epoxy.wasm | TeaVM Bytecode PAL`,
                 `XYZ: ${params.playerX.toFixed(3)} / ${params.playerY.toFixed(5)} / ${params.playerZ.toFixed(3)}`,
                 `Block: ${Math.floor(params.playerX)} ${Math.floor(params.playerY)} ${Math.floor(params.playerZ)} | Chunk: ${Math.floor(params.playerX) >> 4} ${Math.floor(params.playerY) >> 4} ${Math.floor(params.playerZ) >> 4}`,
                 `Facing: Yaw ${params.yawDeg.toFixed(1)} / Pitch ${params.pitchDeg.toFixed(1)}`,

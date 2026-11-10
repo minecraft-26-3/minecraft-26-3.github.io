@@ -833,10 +833,19 @@ class BrowserVFS {
 
 const SoundSource = {}; (function(SoundSource){ SoundSource["MASTER"] = 'master'; SoundSource["MUSIC"] = 'music'; SoundSource["RECORDS"] = 'record'; SoundSource["WEATHER"] = 'weather'; SoundSource["BLOCKS"] = 'block'; SoundSource["HOSTILE"] = 'hostile'; SoundSource["NEUTRAL"] = 'neutral'; SoundSource["PLAYERS"] = 'player'; SoundSource["AMBIENT"] = 'ambient'; SoundSource["VOICE"] = 'voice'; })(SoundSource);
 
+                              
+                 
+              
+              
+              
+                        
+ 
+
 class OpenALAudioEngine {
             ctx                      = null;
             masterGain                  = null;
             categoryGains                             = new Map();
+                    categoryVolumes                           = new Map();
             bufferCache                           = new Map();
             loadingPromises                                           = new Map();
             soundEvents                           = {};
@@ -846,6 +855,16 @@ class OpenALAudioEngine {
             listenerVx = 0;
             listenerVy = 0;
             listenerVz = 0;
+           directionalAudio = true;
+           showSubtitles = false;
+                    activeSubtitles                       = [];
+            menuMusicSource                               = null;
+
+    constructor() {
+        for (const cat of Object.values(SoundSource)) {
+            this.categoryVolumes.set(cat, 1.0);
+        }
+    }
 
            setSoundEventsRegistry(events                          )       {
         this.soundEvents = events;
@@ -862,12 +881,12 @@ class OpenALAudioEngine {
         if (!AudioCtx) return null;
         this.ctx = new AudioCtx();
         this.masterGain = this.ctx.createGain();
-        this.masterGain.gain.value = 0.85;
+        this.masterGain.gain.value = this.categoryVolumes.get(SoundSource.MASTER) ?? 1.0;
         this.masterGain.connect(this.ctx.destination);
 
         for (const cat of Object.values(SoundSource)) {
             const g = this.ctx.createGain();
-            g.gain.value = 1.0;
+            g.gain.value = this.categoryVolumes.get(cat) ?? 1.0;
             g.connect(this.masterGain);
             this.categoryGains.set(cat, g);
         }
@@ -875,12 +894,42 @@ class OpenALAudioEngine {
     }
 
            setCategoryVolume(source             , volume        )       {
+        const clamped = Math.max(0, Math.min(1, volume));
+        this.categoryVolumes.set(source, clamped);
         if (source === SoundSource.MASTER && this.masterGain) {
-            this.masterGain.gain.value = Math.max(0, Math.min(1, volume));
+            this.masterGain.gain.value = clamped;
             return;
         }
         const g = this.categoryGains.get(source);
-        if (g) g.gain.value = Math.max(0, Math.min(1, volume));
+        if (g) g.gain.value = clamped;
+    }
+
+           getCategoryVolume(source             )         {
+        return this.categoryVolumes.get(source) ?? 1.0;
+    }
+
+           async startMenuMusic()                {
+        if (this.menuMusicSource) return;
+        const ctx = this.ensureContext();
+        if (!ctx) return;
+        const buf = await this.loadOggBuffer('music_menu_mutation');
+        if (!buf || this.menuMusicSource) return;
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.loop = true;
+        const catGain = this.categoryGains.get(SoundSource.MUSIC) || this.masterGain ;
+        src.connect(catGain);
+        src.start(0);
+        this.menuMusicSource = src;
+    }
+
+           stopMenuMusic()       {
+        if (this.menuMusicSource) {
+            try {
+                this.menuMusicSource.stop();
+            } catch {}
+            this.menuMusicSource = null;
+        }
     }
 
     /**
@@ -977,8 +1026,29 @@ class OpenALAudioEngine {
         if (!ctx) return;
 
         const cleanEvent = eventId.replace('minecraft:', '');
+        if (this.showSubtitles) {
+            const subLabel = cleanEvent.includes('click')
+                ? 'Button clicks'
+                : cleanEvent.includes('break')
+                    ? 'Block broken'
+                    : cleanEvent.includes('place')
+                        ? 'Block placed'
+                        : cleanEvent.includes('step')
+                            ? 'Footsteps'
+                            : cleanEvent.includes('attack')
+                                ? 'Player attacks'
+                                : cleanEvent.replace(/\./g, ' ');
+            const existing = this.activeSubtitles.find(s => s.text === subLabel);
+            if (existing) {
+                existing.x = x; existing.y = y; existing.z = z;
+                existing.expiresAtMs = performance.now() + 3000;
+            } else {
+                this.activeSubtitles.push({ text: subLabel, x, y, z, expiresAtMs: performance.now() + 3000 });
+                if (this.activeSubtitles.length > 6) this.activeSubtitles.shift();
+            }
+        }
         const candidates = this.soundEvents[cleanEvent];
-        let chosenPath = cleanEvent.replace(/\./g, '/');
+        let chosenPath = cleanEvent === 'ui.button.click' ? 'random_click' : cleanEvent.replace(/\./g, '/');
         if (candidates && candidates.length > 0) {
             chosenPath = candidates[Math.floor(Math.random() * candidates.length)];
         }
@@ -1015,7 +1085,7 @@ class OpenALAudioEngine {
         const catGain = this.categoryGains.get(source) || this.masterGain ;
         if (spatial) {
             const panner = ctx.createPanner();
-            panner.panningModel = 'HRTF';
+            panner.panningModel = this.directionalAudio ? 'HRTF' : 'equalpower';
             panner.distanceModel = 'linear';
             panner.refDistance = 1.0;
             panner.maxDistance = Math.max(16.0, 16.0 * volume);
@@ -1154,6 +1224,667 @@ class ThreadedWorkerPool {
 
            getStatusSummary()         {
         return `${this.workers.length}/${this.workerCount} Workers (${this.sharedMemoryAvailable ? 'SharedArrayBuffer+Atomics' : 'Transferable ArrayBuffer'})`;
+    }
+}
+
+
+// --- Module: runtime/pal.ts ---
+/**
+ * Platform Abstraction Layer (PAL) & TeaVM / JVM Classfile v69.0 Bytecode Runtime Bridge
+ *
+ * Swaps out desktop LWJGL 3 (GLFW, OpenGL, OpenAL, TinyFD, Jemalloc) and Java NIO filesystem
+ * dependencies for Web standards (WebGPU/WebGL2, WebAudio HRTF, Pointer Lock, Fullscreen API,
+ * Origin Private File System / IndexedDB) while executing the authentic Mojang `Options`,
+ * `GameRules`, `KeyMapping`, `I18n`, `PackRepository`, and `LevelStorageSource` data models
+ * transpiled from `.minecraft/versions/26.3/26.3.jar`.
+ */
+
+
+                                
+                 
+                       
+                        
+                       
+                             
+ 
+
+                               
+                      
+                       
+                         
+                         
+                        
+                              
+                                                                             
+                                    
+                                      
+                             
+ 
+
+                            
+               
+                           
+                  
+                        
+                     
+                          
+                            
+                                   
+ 
+
+                           
+                  
+                   
+ 
+
+                                
+                    
+               
+                      
+                          
+                       
+                                  
+      
+ 
+
+                             
+                       
+                      
+                                  
+                                   
+                                   
+                                      
+                       
+                                                                                        
+                                                           
+                                          
+                                  
+                       
+                                                 
+ 
+
+                        
+                                     
+                                                       
+                                       
+                      
+ 
+
+                             
+               
+                       
+                 
+                         
+                      
+                                                   
+                                                        
+                              
+                           
+                                                                                                                    
+                 
+                                
+                        
+                                  
+                      
+                        
+                          
+                        
+                                                
+                        
+                            
+                        
+                       
+                       
+                   
+                  
+                  
+                  
+                       
+                         
+      
+                                                         
+ 
+
+                             
+               
+                  
+                        
+                       
+                     
+                         
+                                           
+                           
+ 
+
+const DEFAULT_KEYBINDS                 = [
+    // Movement (key.categories.movement)
+    { id: 'key.forward', category: 'key.categories.movement', defaultCode: 'KeyW', boundCode: 'KeyW' },
+    { id: 'key.left', category: 'key.categories.movement', defaultCode: 'KeyA', boundCode: 'KeyA' },
+    { id: 'key.back', category: 'key.categories.movement', defaultCode: 'KeyS', boundCode: 'KeyS' },
+    { id: 'key.right', category: 'key.categories.movement', defaultCode: 'KeyD', boundCode: 'KeyD' },
+    { id: 'key.jump', category: 'key.categories.movement', defaultCode: 'Space', boundCode: 'Space' },
+    { id: 'key.sneak', category: 'key.categories.movement', defaultCode: 'ShiftLeft', boundCode: 'ShiftLeft' },
+    { id: 'key.sprint', category: 'key.categories.movement', defaultCode: 'ControlLeft', boundCode: 'ControlLeft' },
+    // Gameplay (key.categories.gameplay)
+    { id: 'key.attack', category: 'key.categories.gameplay', defaultCode: 'Mouse0', boundCode: 'Mouse0' },
+    { id: 'key.pickItem', category: 'key.categories.gameplay', defaultCode: 'Mouse1', boundCode: 'Mouse1' },
+    { id: 'key.use', category: 'key.categories.gameplay', defaultCode: 'Mouse2', boundCode: 'Mouse2' },
+    // Inventory (key.categories.inventory)
+    { id: 'key.inventory', category: 'key.categories.inventory', defaultCode: 'KeyE', boundCode: 'KeyE' },
+    { id: 'key.swapOffhand', category: 'key.categories.inventory', defaultCode: 'KeyF', boundCode: 'KeyF' },
+    { id: 'key.drop', category: 'key.categories.inventory', defaultCode: 'KeyQ', boundCode: 'KeyQ' },
+    { id: 'key.hotbar.1', category: 'key.categories.inventory', defaultCode: 'Digit1', boundCode: 'Digit1' },
+    { id: 'key.hotbar.2', category: 'key.categories.inventory', defaultCode: 'Digit2', boundCode: 'Digit2' },
+    { id: 'key.hotbar.3', category: 'key.categories.inventory', defaultCode: 'Digit3', boundCode: 'Digit3' },
+    { id: 'key.hotbar.4', category: 'key.categories.inventory', defaultCode: 'Digit4', boundCode: 'Digit4' },
+    { id: 'key.hotbar.5', category: 'key.categories.inventory', defaultCode: 'Digit5', boundCode: 'Digit5' },
+    { id: 'key.hotbar.6', category: 'key.categories.inventory', defaultCode: 'Digit6', boundCode: 'Digit6' },
+    { id: 'key.hotbar.7', category: 'key.categories.inventory', defaultCode: 'Digit7', boundCode: 'Digit7' },
+    { id: 'key.hotbar.8', category: 'key.categories.inventory', defaultCode: 'Digit8', boundCode: 'Digit8' },
+    { id: 'key.hotbar.9', category: 'key.categories.inventory', defaultCode: 'Digit9', boundCode: 'Digit9' },
+    { id: 'key.saveToolbarActivator', category: 'key.categories.creative', defaultCode: 'KeyC', boundCode: 'KeyC' },
+    { id: 'key.loadToolbarActivator', category: 'key.categories.creative', defaultCode: 'KeyX', boundCode: 'KeyX' },
+    // Multiplayer (key.categories.multiplayer)
+    { id: 'key.chat', category: 'key.categories.multiplayer', defaultCode: 'KeyT', boundCode: 'KeyT' },
+    { id: 'key.playerlist', category: 'key.categories.multiplayer', defaultCode: 'Tab', boundCode: 'Tab' },
+    { id: 'key.command', category: 'key.categories.multiplayer', defaultCode: 'Slash', boundCode: 'Slash' },
+    { id: 'key.socialInteractions', category: 'key.categories.multiplayer', defaultCode: 'KeyP', boundCode: 'KeyP' },
+    // Miscellaneous (key.categories.misc)
+    { id: 'key.advancements', category: 'key.categories.misc', defaultCode: 'KeyL', boundCode: 'KeyL' },
+    { id: 'key.spectatorOutlines', category: 'key.categories.misc', defaultCode: 'KeyO', boundCode: 'KeyO' },
+    { id: 'key.screenshot', category: 'key.categories.misc', defaultCode: 'F2', boundCode: 'F2' },
+    { id: 'key.smoothCamera', category: 'key.categories.misc', defaultCode: 'F8', boundCode: 'F8' },
+    { id: 'key.fullscreen', category: 'key.categories.misc', defaultCode: 'F11', boundCode: 'F11' },
+    { id: 'key.toggleGui', category: 'key.categories.misc', defaultCode: 'F1', boundCode: 'F1' },
+    { id: 'key.togglePerspective', category: 'key.categories.misc', defaultCode: 'F5', boundCode: 'F5' },
+    { id: 'key.debug.overlay', category: 'key.categories.misc', defaultCode: 'F3', boundCode: 'F3' },
+];
+
+class VanillaOptionsState {
+    // Video Settings (net.minecraft.client.gui.screens.options.VideoSettingsScreen)
+           fov = 70; // 30 .. 110
+           renderDistance = 6; // 2 .. 32 chunks
+           simulationDistance = 8; // 5 .. 32 chunks
+           graphicsMode                                = 'fancy';
+           preferredGraphicsBackend                      = 'WebGPU';
+           smoothLighting                                = 'maximum';
+           guiScale = 0; // 0 = Auto, 1, 2, 3, 4
+           maxFps = 120; // 10 .. 260 (260 = Unlimited)
+           enableVsync = true;
+           gamma = 0.5; // 0.0 (Moody) .. 1.0 (Bright)
+           renderClouds                           = 'fancy';
+           cloudRange = 148; // Cloud height (-64 .. 320)
+           particles                                  = 'all';
+           mipmapLevels = 4; // 0 .. 4
+           biomeBlendRadius = 2; // 0 (Off) .. 7 (15x15)
+           entityDistanceScaling = 1.0; // 0.5 (50%) .. 5.0 (500%)
+           entityShadows = true;
+           screenEffectScale = 1.0; // Distortion Effects 0.0 .. 1.0
+           fovEffectScale = 1.0; // FOV Effects 0.0 .. 1.0
+           bobView = true;
+           attackIndicator                                 = 'crosshair';
+           showAutosaveIndicator = true;
+           fullscreen = false;
+           chunkSectionFadeInTime = 0.25;
+           prioritizeChunkUpdates = 0; // 0 = Threaded, 1 = Semi-Blocking, 2 = Fully Blocking
+
+    // Sound Settings (net.minecraft.client.gui.screens.options.SoundOptionsScreen)
+           soundVolumes                              = {
+        [SoundSource.MASTER]: 1.0,
+        [SoundSource.MUSIC]: 0.7,
+        [SoundSource.RECORDS]: 1.0,
+        [SoundSource.WEATHER]: 1.0,
+        [SoundSource.BLOCKS]: 1.0,
+        [SoundSource.HOSTILE]: 1.0,
+        [SoundSource.NEUTRAL]: 1.0,
+        [SoundSource.PLAYERS]: 1.0,
+        [SoundSource.AMBIENT]: 1.0,
+        [SoundSource.VOICE]: 1.0,
+    };
+           directionalAudio = true;
+           showSubtitles = false;
+           musicFrequency                                      = 'default';
+
+    // Mouse & Controls Settings (MouseSettingsScreen & KeyBindsScreen)
+           mouseSensitivity = 0.5; // 0.0 (*yawn*) .. 1.0 (HYPERSPEED!!!)
+           invertYMouse = false;
+           mouseWheelSensitivity = 1.0;
+           discreteMouseScroll = false;
+           touchscreen = false;
+           autoJump = false;
+           toggleCrouch = false;
+           toggleSprint = false;
+           operatorItemsTab = false;
+           keyBinds                 = DEFAULT_KEYBINDS.map(k => ({ ...k }));
+
+    // Skin Customization (SkinCustomizationScreen)
+           modelPartCape = true;
+           modelPartJacket = true;
+           modelPartLeftSleeve = true;
+           modelPartRightSleeve = true;
+           modelPartLeftPantsLeg = true;
+           modelPartRightPantsLeg = true;
+           modelPartHat = true;
+           mainHand                   = 'right';
+
+    // Language & Font Settings (LanguageSelectScreen)
+           lang = 'en_us';
+           forceUnicodeFont = false;
+
+    // Chat & Accessibility Settings
+           chatVisibility                               = 'full';
+           chatColors = true;
+           chatLinks = true;
+           chatLinksPrompt = true;
+           chatOpacity = 1.0;
+           textBackgroundOpacity = 0.5;
+           chatScale = 1.0;
+           chatLineSpacing = 0.0;
+           chatDelay = 0.0;
+           highContrast = false;
+           menuBackgroundBlurriness = 5; // 0 .. 10
+           panoramaScrollSpeed = 1.0; // 0.0 .. 1.0
+           darkMojangStudiosBackground = false;
+           hideLightningFlashes = false;
+           hideSplashTexts = false;
+           damageTiltStrength = 1.0;
+           glintSpeed = 0.5;
+           glintStrength = 0.75;
+
+    // Resource Packs
+           selectedResourcePacks           = ['vanilla'];
+
+           toOptionsTxt()         {
+        const lines           = [
+            'version:5023',
+            `fov:${((this.fov - 70.0) / 40.0).toFixed(4)}`,
+            `renderDistance:${this.renderDistance}`,
+            `simulationDistance:${this.simulationDistance}`,
+            `graphicsPreset:"${this.graphicsMode}"`,
+            `preferredGraphicsBackend:"${this.preferredGraphicsBackend}"`,
+            `ao:"${this.smoothLighting}"`,
+            `guiScale:${this.guiScale}`,
+            `maxFps:${this.maxFps}`,
+            `enableVsync:${this.enableVsync}`,
+            `gamma:${this.gamma.toFixed(4)}`,
+            `renderClouds:"${this.renderClouds}"`,
+            `cloudRange:${this.cloudRange}`,
+            `particles:"${this.particles}"`,
+            `mipmapLevels:${this.mipmapLevels}`,
+            `biomeBlendRadius:${this.biomeBlendRadius}`,
+            `entityDistanceScaling:${this.entityDistanceScaling.toFixed(2)}`,
+            `entityShadows:${this.entityShadows}`,
+            `screenEffectScale:${this.screenEffectScale.toFixed(4)}`,
+            `fovEffectScale:${this.fovEffectScale.toFixed(4)}`,
+            `bobView:${this.bobView}`,
+            `attackIndicator:"${this.attackIndicator}"`,
+            `showAutosaveIndicator:${this.showAutosaveIndicator}`,
+            `fullscreen:${this.fullscreen}`,
+            `directionalAudio:${this.directionalAudio}`,
+            `showSubtitles:${this.showSubtitles}`,
+            `mouseSensitivity:${this.mouseSensitivity.toFixed(4)}`,
+            `invertYMouse:${this.invertYMouse}`,
+            `mouseWheelSensitivity:${this.mouseWheelSensitivity.toFixed(4)}`,
+            `discrete_mouse_scroll:${this.discreteMouseScroll}`,
+            `autoJump:${this.autoJump}`,
+            `toggleCrouch:${this.toggleCrouch}`,
+            `toggleSprint:${this.toggleSprint}`,
+            `operatorItemsTab:${this.operatorItemsTab}`,
+            `lang:${this.lang}`,
+            `forceUnicodeFont:${this.forceUnicodeFont}`,
+            `mainHand:"${this.mainHand}"`,
+            `modelPart_cape:${this.modelPartCape}`,
+            `modelPart_jacket:${this.modelPartJacket}`,
+            `modelPart_left_sleeve:${this.modelPartLeftSleeve}`,
+            `modelPart_right_sleeve:${this.modelPartRightSleeve}`,
+            `modelPart_left_pants_leg:${this.modelPartLeftPantsLeg}`,
+            `modelPart_right_pants_leg:${this.modelPartRightPantsLeg}`,
+            `modelPart_hat:${this.modelPartHat}`,
+            `highContrast:${this.highContrast}`,
+            `menuBackgroundBlurriness:${this.menuBackgroundBlurriness}`,
+            `panoramaScrollSpeed:${this.panoramaScrollSpeed.toFixed(2)}`,
+            `darkMojangStudiosBackground:${this.darkMojangStudiosBackground}`,
+            `hideSplashTexts:${this.hideSplashTexts}`,
+            `resourcePacks:${JSON.stringify(this.selectedResourcePacks)}`,
+        ];
+        for (const [cat, vol] of Object.entries(this.soundVolumes)) {
+            lines.push(`soundCategory_${cat}:${vol.toFixed(4)}`);
+        }
+        for (const kb of this.keyBinds) {
+            lines.push(`key_${kb.id}:${kb.boundCode}`);
+        }
+        return lines.join('\n');
+    }
+
+           fromOptionsTxt(txt        )       {
+        for (const rawLine of txt.split(/\r?\n/)) {
+            const idx = rawLine.indexOf(':');
+            if (idx <= 0) continue;
+            const k = rawLine.slice(0, idx).trim();
+            const v = rawLine.slice(idx + 1).trim();
+            const unquoted = v.replace(/^"|"$/g, '');
+            if (k === 'fov') this.fov = Math.round(70 + parseFloat(v) * 40);
+            else if (k === 'renderDistance') this.renderDistance = Math.max(2, Math.min(32, parseInt(v, 10) || 6));
+            else if (k === 'simulationDistance') this.simulationDistance = Math.max(5, Math.min(32, parseInt(v, 10) || 8));
+            else if (k === 'graphicsPreset' && (unquoted === 'fast' || unquoted === 'fancy' || unquoted === 'fabulous')) this.graphicsMode = unquoted;
+            else if (k === 'preferredGraphicsBackend' && (unquoted === 'WebGPU' || unquoted === 'WebGL2')) this.preferredGraphicsBackend = unquoted;
+            else if (k === 'ao' && (unquoted === 'off' || unquoted === 'minimum' || unquoted === 'maximum')) this.smoothLighting = unquoted;
+            else if (k === 'guiScale') this.guiScale = Math.max(0, Math.min(4, parseInt(v, 10) || 0));
+            else if (k === 'maxFps') this.maxFps = Math.max(10, Math.min(260, parseInt(v, 10) || 120));
+            else if (k === 'enableVsync') this.enableVsync = v === 'true';
+            else if (k === 'gamma') this.gamma = Math.max(0, Math.min(1, parseFloat(v) || 0.5));
+            else if (k === 'renderClouds' && (unquoted === 'off' || unquoted === 'fast' || unquoted === 'fancy')) this.renderClouds = unquoted;
+            else if (k === 'cloudRange') this.cloudRange = parseInt(v, 10) || 148;
+            else if (k === 'particles' && (unquoted === 'all' || unquoted === 'decreased' || unquoted === 'minimal')) this.particles = unquoted;
+            else if (k === 'mipmapLevels') this.mipmapLevels = Math.max(0, Math.min(4, parseInt(v, 10) || 4));
+            else if (k === 'biomeBlendRadius') this.biomeBlendRadius = Math.max(0, Math.min(7, parseInt(v, 10) || 2));
+            else if (k === 'entityDistanceScaling') this.entityDistanceScaling = Math.max(0.5, Math.min(5.0, parseFloat(v) || 1.0));
+            else if (k === 'entityShadows') this.entityShadows = v === 'true';
+            else if (k === 'screenEffectScale') this.screenEffectScale = parseFloat(v) ?? 1.0;
+            else if (k === 'fovEffectScale') this.fovEffectScale = parseFloat(v) ?? 1.0;
+            else if (k === 'bobView') this.bobView = v === 'true';
+            else if (k === 'attackIndicator' && (unquoted === 'crosshair' || unquoted === 'hotbar' || unquoted === 'off')) this.attackIndicator = unquoted;
+            else if (k === 'directionalAudio') this.directionalAudio = v === 'true';
+            else if (k === 'showSubtitles') this.showSubtitles = v === 'true';
+            else if (k === 'mouseSensitivity') this.mouseSensitivity = parseFloat(v) ?? 0.5;
+            else if (k === 'invertYMouse') this.invertYMouse = v === 'true';
+            else if (k === 'mouseWheelSensitivity') this.mouseWheelSensitivity = parseFloat(v) || 1.0;
+            else if (k === 'discrete_mouse_scroll') this.discreteMouseScroll = v === 'true';
+            else if (k === 'autoJump') this.autoJump = v === 'true';
+            else if (k === 'toggleCrouch') this.toggleCrouch = v === 'true';
+            else if (k === 'toggleSprint') this.toggleSprint = v === 'true';
+            else if (k === 'operatorItemsTab') this.operatorItemsTab = v === 'true';
+            else if (k === 'lang') this.lang = unquoted || 'en_us';
+            else if (k === 'forceUnicodeFont') this.forceUnicodeFont = v === 'true';
+            else if (k === 'mainHand' && (unquoted === 'right' || unquoted === 'left')) this.mainHand = unquoted;
+            else if (k === 'modelPart_cape') this.modelPartCape = v === 'true';
+            else if (k === 'modelPart_jacket') this.modelPartJacket = v === 'true';
+            else if (k === 'modelPart_left_sleeve') this.modelPartLeftSleeve = v === 'true';
+            else if (k === 'modelPart_right_sleeve') this.modelPartRightSleeve = v === 'true';
+            else if (k === 'modelPart_left_pants_leg') this.modelPartLeftPantsLeg = v === 'true';
+            else if (k === 'modelPart_right_pants_leg') this.modelPartRightPantsLeg = v === 'true';
+            else if (k === 'modelPart_hat') this.modelPartHat = v === 'true';
+            else if (k === 'highContrast') this.highContrast = v === 'true';
+            else if (k === 'menuBackgroundBlurriness') this.menuBackgroundBlurriness = parseInt(v, 10) ?? 5;
+            else if (k === 'panoramaScrollSpeed') this.panoramaScrollSpeed = parseFloat(v) ?? 1.0;
+            else if (k === 'darkMojangStudiosBackground') this.darkMojangStudiosBackground = v === 'true';
+            else if (k === 'hideSplashTexts') this.hideSplashTexts = v === 'true';
+            else if (k.startsWith('soundCategory_')) {
+                const cat = k.slice('soundCategory_'.length)               ;
+                if (cat in this.soundVolumes) {
+                    this.soundVolumes[cat] = Math.max(0, Math.min(1, parseFloat(v) || 0));
+                }
+            } else if (k.startsWith('key_')) {
+                const kbId = k.slice(4);
+                const entry = this.keyBinds.find(b => b.id === kbId);
+                if (entry && v) entry.boundCode = v;
+            }
+        }
+    }
+
+           getKeyCode(keyId        )         {
+        return this.keyBinds.find(k => k.id === keyId)?.boundCode || '';
+    }
+}
+
+class PlatformAbstractionLayer {
+                    vfs            ;
+                    audio                   ;
+                    options = new VanillaOptionsState();
+           bytecodeBundle                    ;
+           enUsDict                         = {};
+           activeLangDict                         = {};
+           savedWorlds                      = [];
+           availableResourcePacks                      = [
+        {
+            id: 'vanilla',
+            title: 'Default',
+            description: 'The default look and feel of Minecraft 26.3',
+            packFormat: 55,
+            builtIn: true,
+        },
+        {
+            id: 'high_contrast',
+            title: 'High Contrast',
+            description: 'Increases UI contrast for improved readability',
+            packFormat: 55,
+            builtIn: true,
+            highContrast: true,
+        },
+        {
+            id: 'programmer_art',
+            title: 'Programmer Art',
+            description: 'Classic developer textures from earlier eras',
+            packFormat: 55,
+            builtIn: true,
+        },
+    ];
+
+    constructor(vfs            , audio                   ) {
+        this.vfs = vfs;
+        this.audio = audio;
+    }
+
+           async init(bytecodeUrl = 'assets/bytecode_gui.json', enUsDict                         = {})                {
+        this.enUsDict = enUsDict;
+        this.activeLangDict = { ...enUsDict };
+
+        const resp = await fetch(bytecodeUrl);
+        this.bytecodeBundle = await resp.json();
+
+        // Load persisted options.txt from BrowserVFS (OPFS / IndexedDB)
+        const savedOptBytes = await this.vfs.readFile('options.txt');
+        if (savedOptBytes) {
+            const txt = new TextDecoder('utf-8').decode(savedOptBytes);
+            this.options.fromOptionsTxt(txt);
+        }
+        this.syncAudioOptions();
+
+        if (this.options.lang !== 'en_us') {
+            await this.loadLanguage(this.options.lang);
+        }
+
+        // Load saved worlds from BrowserVFS
+        await this.loadSavedWorlds();
+    }
+
+           async saveOptions()                {
+        this.syncAudioOptions();
+        const txt = this.options.toOptionsTxt();
+        await this.vfs.writeFile('options.txt', new TextEncoder().encode(txt));
+    }
+
+           syncAudioOptions()       {
+        for (const [cat, vol] of Object.entries(this.options.soundVolumes)) {
+            this.audio.setCategoryVolume(cat               , vol);
+        }
+        this.audio.directionalAudio = this.options.directionalAudio;
+        this.audio.showSubtitles = this.options.showSubtitles;
+    }
+
+    /**
+     * Loads any of the 143 language `.json` files extracted from `.minecraft/assets/indexes/34.json`
+     * into `activeLangDict` for instant UI text reloading.
+     */
+           async loadLanguage(langCode        )                {
+        const cleanCode = langCode.toLowerCase();
+        this.options.lang = cleanCode;
+        if (cleanCode === 'en_us') {
+            this.activeLangDict = { ...this.enUsDict };
+            return;
+        }
+        try {
+            const resp = await fetch(`assets/lang/${cleanCode}.json`);
+            if (resp.ok) {
+                const langJson = await resp.json();
+                this.activeLangDict = { ...this.enUsDict, ...langJson };
+            }
+        } catch {
+            this.activeLangDict = { ...this.enUsDict };
+        }
+    }
+
+    /**
+     * Authentic `net.minecraft.client.resources.language.I18n.get(key, ...args)` implementation.
+     */
+           translate(key        , ...args                        )         {
+        let template = this.activeLangDict[key] ?? this.enUsDict[key] ?? key;
+        if (args.length === 0) return template;
+        let argIdx = 0;
+        template = template.replace(/%(\d+\$)?[sd]/g, (_m, posGroup) => {
+            if (posGroup) {
+                const p = parseInt(posGroup.slice(0, -1), 10) - 1;
+                return String(args[p] ?? '');
+            }
+            return String(args[argIdx++] ?? '');
+        });
+        return template;
+    }
+
+           getClassMeta(className        )                                  {
+        return this.bytecodeBundle?.classes?.[className];
+    }
+
+           async loadSavedWorlds()                {
+        const raw = await this.vfs.readFile('saves/worlds_index.json');
+        if (raw) {
+            try {
+                this.savedWorlds = JSON.parse(new TextDecoder('utf-8').decode(raw));
+                return;
+            } catch {}
+        }
+        // Provide a default locally generated world in OPFS/IndexedDB if none exist yet
+        const defaultGameRules                                   = {};
+        for (const gr of this.bytecodeBundle?.gameRules || []) {
+            defaultGameRules[gr.id] = gr.defaultValue;
+        }
+        this.savedWorlds = [
+            {
+                id: 'world_26_3_default',
+                folderName: 'New World',
+                name: 'New World',
+                lastPlayedMs: Date.now() - 3600_000,
+                createdMs: Date.now() - 7200_000,
+                gameMode: 'survival',
+                difficulty: 'normal',
+                difficultyLocked: false,
+                allowCommands: true,
+                worldType: 'normal',
+                seed: '2632026',
+                generateStructures: true,
+                bonusChest: false,
+                flatLayers: [
+                    { block: 'minecraft:bedrock', height: 1 },
+                    { block: 'minecraft:dirt', height: 2 },
+                    { block: 'minecraft:grass_block', height: 1 },
+                ],
+                flatBiome: 'minecraft:plains',
+                singleBiome: 'minecraft:pale_garden',
+                experiments: ['vanilla'],
+                dataPacks: ['vanilla'],
+                gameRules: defaultGameRules,
+                versionName: '26.3',
+                protocolVersion: 777,
+                dataVersion: 5023,
+                iconColor1: '#59ae30',
+                iconColor2: '#7a5838',
+            },
+        ];
+        await this.persistSavedWorlds();
+    }
+
+           async persistSavedWorlds()                {
+        const bytes = new TextEncoder().encode(JSON.stringify(this.savedWorlds));
+        await this.vfs.writeFile('saves/worlds_index.json', bytes);
+    }
+
+    /**
+     * Parses a user-dropped `.zip` Resource Pack in the browser (reading `pack.mcmeta`, `pack.png`,
+     * and any `assets/minecraft/lang/*.json` overrides) and adds it to `availableResourcePacks`.
+     */
+           async importZipResourcePack(file      )                             {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+        let eocd = buf.byteLength - 22;
+        while (eocd >= 0 && dv.getUint32(eocd, true) !== 0x06054b50) eocd--;
+
+        let description = `Custom Resource Pack (${(file.size / 1024).toFixed(1)} KB)`;
+        let packFormat = 55;
+        let iconDataUrl                    ;
+        let langOverrides                                    ;
+
+        if (eocd >= 0) {
+            const cdCount = dv.getUint16(eocd + 10, true);
+            const cdOffset = dv.getUint32(eocd + 16, true);
+            let ptr = cdOffset;
+            for (let i = 0; i < cdCount && ptr + 46 <= buf.byteLength; i++) {
+                if (dv.getUint32(ptr, true) !== 0x02014b50) break;
+                const method = dv.getUint16(ptr + 10, true);
+                const compSize = dv.getUint32(ptr + 20, true);
+                const nLen = dv.getUint16(ptr + 28, true);
+                const xLen = dv.getUint16(ptr + 30, true);
+                const cLen = dv.getUint16(ptr + 32, true);
+                const lho = dv.getUint32(ptr + 42, true);
+                const entryName = new TextDecoder('utf-8').decode(buf.subarray(ptr + 46, ptr + 46 + nLen));
+                ptr += 46 + nLen + xLen + cLen;
+
+                if (entryName === 'pack.mcmeta' || entryName === 'pack.png' || entryName === 'assets/minecraft/lang/en_us.json') {
+                    const lnLen = dv.getUint16(lho + 26, true);
+                    const lxLen = dv.getUint16(lho + 28, true);
+                    const dataStart = lho + 30 + lnLen + lxLen;
+                    const slice = buf.subarray(dataStart, dataStart + compSize);
+                    let rawBytes                    = null;
+                    if (method === 0) {
+                        rawBytes = slice;
+                    } else if (method === 8 && typeof DecompressionStream !== 'undefined') {
+                        try {
+                            const ds = new DecompressionStream('deflate-raw');
+                            const writer = ds.writable.getWriter();
+                            writer.write(slice                           );
+                            writer.close();
+                            rawBytes = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+                        } catch {}
+                    }
+                    if (rawBytes) {
+                        if (entryName === 'pack.mcmeta') {
+                            try {
+                                const meta = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                                if (meta.pack?.description) {
+                                    description = typeof meta.pack.description === 'string'
+                                        ? meta.pack.description
+                                        : (meta.pack.description.text || JSON.stringify(meta.pack.description));
+                                }
+                                if (meta.pack?.pack_format) packFormat = Number(meta.pack.pack_format);
+                            } catch {}
+                        } else if (entryName === 'pack.png') {
+                            const blob = new Blob([rawBytes                       ], { type: 'image/png' });
+                            iconDataUrl = URL.createObjectURL(blob);
+                        } else if (entryName === 'assets/minecraft/lang/en_us.json') {
+                            try {
+                                langOverrides = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                            } catch {}
+                        }
+                    }
+                }
+            }
+        }
+
+        const id = `file/${file.name}`;
+        await this.vfs.writeFile(`resourcepacks/${file.name}`, buf);
+        const existingIdx = this.availableResourcePacks.findIndex(p => p.id === id);
+        const packEntry                    = {
+            id,
+            title: file.name.replace(/\.zip$/i, ''),
+            description,
+            packFormat,
+            builtIn: false,
+            iconDataUrl,
+            langOverrides,
+        };
+        if (existingIdx >= 0) this.availableResourcePacks[existingIdx] = packEntry;
+        else this.availableResourcePacks.push(packEntry);
+        return packEntry;
     }
 }
 
@@ -3586,6 +4317,30 @@ class ClientWorld {
            isRaining = false;
             nextEntityId = 100;
 
+    // World Creation & GameRules Configuration (wired to CreateWorldScreen & InWorldGameRulesScreen)
+           worldType                                                                                                       = 'normal';
+           flatLayers                                           = [
+        { block: 'minecraft:bedrock', height: 1 },
+        { block: 'minecraft:dirt', height: 2 },
+        { block: 'minecraft:grass_block', height: 1 },
+    ];
+           flatBiome = 'minecraft:plains';
+           singleBiome = 'minecraft:pale_garden';
+           generateStructures = true;
+           bonusChest = false;
+           gameRules                                   = {
+        advance_time: true,
+        advance_weather: true,
+        spawn_mobs: true,
+        random_tick_speed: 3,
+        keep_inventory: false,
+        fall_damage: true,
+        drowning_damage: true,
+        fire_damage: true,
+        mob_griefing: true,
+        pvp: true,
+    };
+
     // Fast cached IDs for core blocks
            idAir = 0;
            idStone = 1;
@@ -3629,8 +4384,26 @@ class ClientWorld {
     constructor(
         blocks                      ,
         biomes                      ,
-        noiseRouter                     
+        noiseRouter                     ,
+        config            
+                                                
+                                                  
+                              
+                                
+                                        
+                                
+                                                        
+          
     ) {
+        if (config) {
+            if (config.worldType) this.worldType = config.worldType;
+            if (config.flatLayers) this.flatLayers = config.flatLayers.map(l => ({ ...l }));
+            if (config.flatBiome) this.flatBiome = config.flatBiome;
+            if (config.singleBiome) this.singleBiome = config.singleBiome;
+            if (config.generateStructures !== undefined) this.generateStructures = config.generateStructures;
+            if (config.bonusChest !== undefined) this.bonusChest = config.bonusChest;
+            if (config.gameRules) this.gameRules = { ...this.gameRules, ...config.gameRules };
+        }
         this.blocksById = new Array(blocks.length);
         for (const b of blocks) {
             const raw = b                                      ;
@@ -3800,6 +4573,63 @@ class ClientWorld {
         const rng = new Xoroshiro128PlusPlus(
             this.noiseRouter.getSeed() ^ (BigInt(chunkX) * 341873128712n + BigInt(chunkZ) * 132897987541n)
         );
+
+        // Superflat World Generator (CreateFlatWorldScreen custom layer stack)
+        if (this.worldType === 'flat') {
+            const flatBiomeClean = this.flatBiome.replace('minecraft:', '');
+            const bEntry = this.biomeByName.get(flatBiomeClean) || this.biomeByName.get('plains') || this.biomesById[0];
+            col.biomes.fill(bEntry ? bEntry.rawId : 0);
+            let curY = CHUNK_MIN_Y;
+            for (const layer of this.flatLayers) {
+                const blkClean = layer.block.replace('minecraft:', '');
+                const blkId = this.blockByName.get(blkClean)?.rawId ?? this.idStone;
+                const h = Math.max(0, Math.min(256, layer.height));
+                for (let dy = 0; dy < h && curY < CHUNK_MAX_Y; dy++, curY++) {
+                    for (let lz = 0; lz < 16; lz++) {
+                        for (let lx = 0; lx < 16; lx++) {
+                            col.setBlock(lx, curY, lz, blkId);
+                            if (blkId === this.idWater || blkId === this.idLava) {
+                                col.setFluidLevel(lx, curY, lz, 8);
+                            }
+                        }
+                    }
+                }
+            }
+            const topY = Math.max(CHUNK_MIN_Y, curY - 1);
+            col.heightmap.fill(topY);
+            if (this.generateStructures && (chunkX & 7) === 2 && (chunkZ & 7) === 2 && this.structures.size > 0) {
+                const structIter = this.structures.values().next();
+                if (!structIter.done && structIter.value) {
+                    this.placeStructureInChunk(col, structIter.value, 2, topY + 1, 2);
+                }
+            }
+            for (let lz = 0; lz < 16; lz++) {
+                for (let lx = 0; lx < 16; lx++) {
+                    this.recalculateColumnLight(col, lx, lz);
+                }
+            }
+            return col;
+        }
+
+        // Debug All Block States Generator
+        if (this.worldType === 'debug_all_block_states') {
+            col.heightmap.fill(70);
+            for (let lz = 0; lz < 16; lz++) {
+                for (let lx = 0; lx < 16; lx++) {
+                    col.setBlock(lx, 60, lz, this.idBedrock);
+                    const wx = baseX + lx;
+                    const wz = baseZ + lz;
+                    if ((wx & 1) === 0 && (wz & 1) === 0 && wx >= 0 && wz >= 0) {
+                        const gridIdx = ((wz >> 1) * 40 + (wx >> 1)) % this.blocksById.length;
+                        const b = this.blocksById[gridIdx];
+                        if (b && !b.properties.air) col.setBlock(lx, 70, lz, b.rawId);
+                    }
+                    this.recalculateColumnLight(col, lx, lz);
+                }
+            }
+            return col;
+        }
+
         const caveNoise = this.noiseRouter.getNoise('minecraft:spaghetti_2d');
         const sulfurNoise = this.noiseRouter.getNoise('minecraft:ore_vein_a');
 
@@ -3807,7 +4637,15 @@ class ClientWorld {
             for (let lx = 0; lx < 16; lx++) {
                 const wx = baseX + lx;
                 const wz = baseZ + lz;
-                const { surfaceY, sample } = this.noiseRouter.computeColumnHeight(wx, wz);
+                const sampleX = this.worldType === 'large_biomes' ? Math.floor(wx / 4) : wx;
+                const sampleZ = this.worldType === 'large_biomes' ? Math.floor(wz / 4) : wz;
+                let { surfaceY, sample } = this.noiseRouter.computeColumnHeight(sampleX, sampleZ);
+                if (this.worldType === 'amplified' && surfaceY > seaLevel) {
+                    surfaceY = Math.min(CHUNK_MAX_Y - 12, seaLevel + Math.round((surfaceY - seaLevel) * 2.25));
+                }
+                if (this.worldType === 'single_biome_surface') {
+                    sample = { ...sample, biomeName: this.singleBiome.replace('minecraft:', '') };
+                }
                 col.heightmap[(lz << 4) | lx] = surfaceY;
 
                 const biomeEntry = this.biomeByName.get(sample.biomeName) || this.biomeByName.get('plains') || this.biomesById[0];
@@ -3933,8 +4771,20 @@ class ClientWorld {
             }
         }
 
+        // Place Bonus Chest at spawn chunk (0, 0) if Bonus Chest option is enabled
+        if (this.bonusChest && chunkX === 0 && chunkZ === 0) {
+            const bx = 7, bz = 6;
+            const by = col.heightmap[(bz << 4) | bx] + 1;
+            col.setBlock(bx, by, bz, this.idChest);
+            this.blockEntities.set(BlockPos.asLong(bx, by, bz), { x: bx, y: by, z: bz, type: 'chest', openProgress: 0 });
+            col.setBlock(bx - 1, by, bz, this.idTorch);
+            col.setBlock(bx + 1, by, bz, this.idTorch);
+            col.setBlock(bx, by, bz - 1, this.idTorch);
+            col.setBlock(bx, by, bz + 1, this.idTorch);
+        }
+
         // Place authentic .nbt structure template on landmark chunks (e.g., abandoned_camp or plains house)
-        if (((chunkX & 7) === 2 && (chunkZ & 7) === 2) && this.structures.size > 0) {
+        if (this.generateStructures && ((chunkX & 7) === 2 && (chunkZ & 7) === 2) && this.structures.size > 0) {
             const structIter = this.structures.values().next();
             if (!structIter.done && structIter.value) {
                 this.placeStructureInChunk(col, structIter.value, 2, col.heightmap[(2 << 4) | 2] + 1, 2);
@@ -3949,7 +4799,7 @@ class ClientWorld {
         }
 
         // Spawn passive mobs and Minecraft 26.3's Sulfur Cube entity
-        if (this.entities.size < 28 && rng.nextInt(3) === 0) {
+        if (this.gameRules.spawn_mobs !== false && this.entities.size < 28 && rng.nextInt(3) === 0) {
             const sx = baseX + 8;
             const sz = baseZ + 8;
             const sy = col.heightmap[(8 << 4) | 8] + 1;
@@ -4809,6 +5659,9 @@ class ChunkMesher {
             world             ;
             blockUvs                              ;
             defaultUv              ;
+           smoothLighting                                = 'maximum';
+           biomeBlendRadius = 2;
+           graphicsMode                                = 'fancy';
 
     constructor(world             , blockUvs                              ) {
         this.world = world;
@@ -4836,12 +5689,14 @@ class ChunkMesher {
         s1x        , s1y        , s1z        ,
         s2x        , s2y        , s2z        
     )         {
+        if (this.smoothLighting === 'off') return 1.0;
         const side1 = this.isOccludingAt(wx + s1x, wy + s1y, wz + s1z) ? 1 : 0;
         const side2 = this.isOccludingAt(wx + s2x, wy + s2y, wz + s2z) ? 1 : 0;
-        if (side1 && side2) return 0.48;
+        const weight = this.smoothLighting === 'minimum' ? 0.09 : 0.16;
+        if (side1 && side2) return 1.0 - 3 * weight;
         const corner = this.isOccludingAt(wx + s1x + s2x, wy + s1y + s2y, wz + s1z + s2z) ? 1 : 0;
         const occluded = side1 + side2 + corner;
-        return 1.0 - occluded * 0.16;
+        return 1.0 - occluded * weight;
     }
 
             getBiomeTintRGBA(col             , lx        , lz        , block                    , face                         )         {
@@ -5354,9 +6209,21 @@ class DualRenderEngine {
             atlasCtx                                  = null;
             lightmapPixels = new Uint8Array(16 * 16 * 4);
             lastLightmapSun = -1;
+            lastLightmapGamma = -1;
            renderedChunksCount = 0;
            culledChunksCount = 0;
            totalGpuVertices = 0;
+
+    // Live Video & Skin Settings (wired to VideoSettingsScreen & SkinCustomizationScreen)
+           gamma = 0.5; // 0.0 (Moody) .. 1.0 (Bright)
+           cloudMode                           = 'fancy';
+           cloudHeight = 148;
+           particlesMode                                  = 'all';
+           entityDistanceScaling = 1.0; // 0.5 (50%) .. 5.0 (500%)
+           entityShadows = true;
+           guiScale = 0; // 0 = Auto, 1..4 = fixed scale
+           mainHand                   = 'right';
+           attackIndicator                                 = 'crosshair';
 
     constructor(canvas3D                   , canvasGui                   ) {
         this.canvas3D = canvas3D;
@@ -5683,15 +6550,18 @@ class DualRenderEngine {
      * Recomputes the 16x16 dynamic Sky/Block Lightmap (`lightmap.fsh` formula) when time-of-day sunlight changes.
      */
             updateLightmapPixels(sunBrightness        )       {
-        if (Math.abs(sunBrightness - this.lastLightmapSun) < 0.01) return;
+        if (Math.abs(sunBrightness - this.lastLightmapSun) < 0.01 && Math.abs(this.gamma - this.lastLightmapGamma) < 0.01) return;
         this.lastLightmapSun = sunBrightness;
+        this.lastLightmapGamma = this.gamma;
+        const gammaExp = Math.max(0.45, 1.55 - this.gamma * 0.9);
+        const ambientFloor = 0.05 + this.gamma * 0.14;
 
         for (let skyIdx = 0; skyIdx < 16; skyIdx++) {
             const skyNorm = (skyIdx / 15.0) * sunBrightness;
-            const skyCurve = Math.pow(skyNorm, 1.35) * 0.92 + 0.08;
+            const skyCurve = Math.pow(skyNorm, gammaExp) * (1.0 - ambientFloor) + ambientFloor;
             for (let blkIdx = 0; blkIdx < 16; blkIdx++) {
                 const blkNorm = blkIdx / 15.0;
-                const blkCurve = Math.pow(blkNorm, 1.25);
+                const blkCurve = Math.pow(blkNorm, gammaExp * 0.92);
 
                 // Warm torchlight tint for blockLight + cool daylight/moonlight for skyLight
                 const r = Math.min(255, Math.round(Math.max(skyCurve, blkCurve * 1.05) * 255));
@@ -5782,13 +6652,32 @@ class DualRenderEngine {
         this.chunkSlots.set(key, slot);
     }
 
+           clearChunkMeshes()       {
+        for (const existing of this.chunkSlots.values()) {
+            existing.wgpuOpaque?.destroy();
+            existing.wgpuCutout?.destroy();
+            existing.wgpuTranslucent?.destroy();
+            if (this.gl) {
+                if (existing.glOpaqueVao) this.gl.deleteVertexArray(existing.glOpaqueVao);
+                if (existing.glOpaqueVbo) this.gl.deleteBuffer(existing.glOpaqueVbo);
+                if (existing.glCutoutVao) this.gl.deleteVertexArray(existing.glCutoutVao);
+                if (existing.glCutoutVbo) this.gl.deleteBuffer(existing.glCutoutVbo);
+                if (existing.glTranslucentVao) this.gl.deleteVertexArray(existing.glTranslucentVao);
+                if (existing.glTranslucentVbo) this.gl.deleteBuffer(existing.glTranslucentVbo);
+            }
+        }
+        this.chunkSlots.clear();
+    }
+
     /**
      * Spawns 3D block-break debris or environmental particles (`sulfur_bubbles`, `flame`, `rain`).
      */
            spawnBlockBreakParticles(x        , y        , z        , uv              , tint = 0xffffffff)       {
-        for (let ix = 0; ix < 3; ix++) {
-            for (let iy = 0; iy < 3; iy++) {
-                for (let iz = 0; iz < 3; iz++) {
+        if (this.particlesMode === 'minimal') return;
+        const step = this.particlesMode === 'decreased' ? 2 : 1;
+        for (let ix = 0; ix < 3; ix += step) {
+            for (let iy = 0; iy < 3; iy += step) {
+                for (let iz = 0; iz < 3; iz += step) {
                     const px = x + (ix + 0.5) / 3;
                     const py = y + (iy + 0.5) / 3;
                     const pz = z + (iz + 0.5) / 3;
@@ -5863,30 +6752,38 @@ class DualRenderEngine {
         const my = camY - Math.sin(sunAngleRad) * skyRadius;
         this.emitBox(dyn, mx - 5, my - 5, sz - 5, mx + 5, my + 5, sz + 5, moonUv, fullBright, packRGBA(210, 225, 255, 255));
 
-        // Pass 7B: 3D Volumetric Cloud Layer at Y = 148
-        const snowUv = mesher.getUV('snow');
-        const cloudDrift = (Number(world.worldAgeTicks) + partialTick) * 0.03;
-        const cloudLight = packLightAndAO(12, 15, 0.95);
-        const cloudColor = packRGBA(248, 250, 255, 220);
-        const baseCloudX = Math.floor((camX + cloudDrift) / 24) * 24;
-        const baseCloudZ = Math.floor(camZ / 24) * 24;
-        for (let cx = -3; cx <= 3; cx++) {
-            for (let cz = -3; cz <= 3; cz++) {
-                const wx = baseCloudX + cx * 24 - (cloudDrift % 24);
-                const wz = baseCloudZ + cz * 24;
-                const hash = ((Math.floor((wx + cloudDrift) / 24) * 73856093) ^ (Math.floor(wz / 24) * 19349663)) & 7;
-                if (hash < 3) {
-                    this.emitBox(dyn, wx, 148, wz, wx + 18, 151.5, wz + 14, snowUv, cloudLight, cloudColor);
+        // Pass 7B: 3D Volumetric Cloud Layer (controlled by VideoSettingsScreen Clouds & Cloud Height)
+        if (this.cloudMode !== 'off') {
+            const snowUv = mesher.getUV('snow');
+            const cloudDrift = (Number(world.worldAgeTicks) + partialTick) * 0.03;
+            const cloudLight = packLightAndAO(12, 15, 0.95);
+            const cloudColor = packRGBA(248, 250, 255, 220);
+            const baseCloudX = Math.floor((camX + cloudDrift) / 24) * 24;
+            const baseCloudZ = Math.floor(camZ / 24) * 24;
+            const cThick = this.cloudMode === 'fancy' ? 3.5 : 0.25;
+            for (let cx = -3; cx <= 3; cx++) {
+                for (let cz = -3; cz <= 3; cz++) {
+                    const wx = baseCloudX + cx * 24 - (cloudDrift % 24);
+                    const wz = baseCloudZ + cz * 24;
+                    const hash = ((Math.floor((wx + cloudDrift) / 24) * 73856093) ^ (Math.floor(wz / 24) * 19349663)) & 7;
+                    if (hash < 3) {
+                        this.emitBox(dyn, wx, this.cloudHeight, wz, wx + 18, this.cloudHeight + cThick, wz + 14, snowUv, cloudLight, cloudColor);
+                    }
                 }
             }
         }
 
         // Pass 4: Entity Models (Sulfur Cube, Passive & Hostile Mobs with partialTick interpolation)
+        const maxEntDist = 64.0 * this.entityDistanceScaling;
+        const shadowUv = mesher.getUV('obsidian');
         for (const ent of world.entities.values()) {
             const ex = ent.prevX + (ent.x - ent.prevX) * partialTick;
             const ey = ent.prevY + (ent.y - ent.prevY) * partialTick;
             const ez = ent.prevZ + (ent.z - ent.prevZ) * partialTick;
-            if (Math.hypot(ex - camX, ez - camZ) > 64) continue;
+            if (Math.hypot(ex - camX, ez - camZ) > maxEntDist) continue;
+            if (this.entityShadows) {
+                this.emitBox(dyn, ex - 0.28, ey + 0.01, ez - 0.28, ex + 0.28, ey + 0.03, ez + 0.28, shadowUv, fullBright, packRGBA(15, 15, 15, 140));
+            }
 
             const entLight = packLightAndAO(4, 15, 1.0);
             const hurtTint = ent.hurtTime > 0 ? packRGBA(255, 110, 110, 255) : 0xffffffff;
@@ -6315,23 +7212,28 @@ class DualRenderEngine {
                              
                         
                             
+                          
+                                                        
+                                                         
      )       {
         const ctx = this.guiCtx;
         const w = this.canvasGui.width;
         const h = this.canvasGui.height;
         ctx.clearRect(0, 0, w, h);
+        if (params.hideGui) return;
 
-        // 1. Render First-Person Right-Hand Held Block in bottom-right corner with swing animation
+        // 1. Render First-Person Held Block in bottom-right (or bottom-left if Main Hand: Left) with swing animation
         const heldBlock = params.hotbarBlocks[params.selectedHotbarSlot];
         if (heldBlock && this.blockAtlasImg) {
             const swingSin = Math.sin(params.swingProgress * Math.PI);
-            const handX = w - 210 - swingSin * 45;
+            const isLeft = this.mainHand === 'left';
+            const handX = isLeft ? (82 + swingSin * 45) : (w - 210 - swingSin * 45);
             const handY = h - 180 + Math.abs(swingSin) * 35;
             const uv = params.blockUvs[heldBlock.textures.north] || params.blockUvs[heldBlock.textures.up];
             if (uv) {
                 ctx.save();
                 ctx.translate(handX, handY);
-                ctx.rotate(-0.18 - swingSin * 0.45);
+                ctx.rotate(isLeft ? (0.18 + swingSin * 0.45) : (-0.18 - swingSin * 0.45));
                 ctx.drawImage(this.blockAtlasImg, uv.x, uv.y, uv.w, uv.h, 0, 0, 128, 128);
                 ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
                 ctx.fillRect(0, 0, 128, 128);
@@ -6339,48 +7241,54 @@ class DualRenderEngine {
             }
         }
 
-        // 2. Crosshair (Inverted-style crisp pixel crosshair)
+        // 2. Crosshair (Inverted-style crisp pixel crosshair + optional Attack Indicator)
         const cx = Math.floor(w / 2);
         const cy = Math.floor(h / 2);
         ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
         ctx.fillRect(cx - 8, cy - 1, 16, 2);
         ctx.fillRect(cx - 1, cy - 8, 2, 16);
+        if (this.attackIndicator === 'crosshair' && params.swingProgress > 0) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+            ctx.fillRect(cx - 8, cy + 12, Math.floor(16 * (1.0 - params.swingProgress)), 3);
+        }
 
-        // 3. Survival Hearts, Hunger Drumsticks & Experience Bar above Hotbar
-        const scale = 3;
+        // 3. Survival/Hardcore Hearts, Hunger Drumsticks & Experience Bar above Hotbar
+        const scale = this.guiScale > 0 ? Math.max(2, Math.min(4, this.guiScale)) : 3;
         const hotbarW = 182 * scale;
         const hotbarH = 22 * scale;
         const hotbarX = Math.floor((w - hotbarW) / 2);
         const hotbarY = h - hotbarH - 12;
 
-        // Hearts (10 hearts = 20 HP)
-        for (let i = 0; i < 10; i++) {
-            const hx = hotbarX + i * 24;
-            const hy = hotbarY - 34;
-            ctx.fillStyle = '#000000';
-            ctx.fillRect(hx, hy, 20, 20);
-            ctx.fillStyle = (i * 2 + 1) <= params.health ? '#e52521' : '#3a1010';
-            ctx.fillRect(hx + 2, hy + 2, 16, 16);
-            ctx.fillStyle = '#ff7b79';
-            ctx.fillRect(hx + 4, hy + 4, 4, 4);
-        }
+        if (params.gameMode !== 'creative') {
+            // Hearts (10 hearts = 20 HP, with Hardcore eyebrow marks if hardcore)
+            for (let i = 0; i < 10; i++) {
+                const hx = hotbarX + i * 24;
+                const hy = hotbarY - 34;
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(hx, hy, 20, 20);
+                ctx.fillStyle = (i * 2 + 1) <= params.health ? (params.gameMode === 'hardcore' ? '#c81010' : '#e52521') : '#3a1010';
+                ctx.fillRect(hx + 2, hy + 2, 16, 16);
+                ctx.fillStyle = '#ff7b79';
+                ctx.fillRect(hx + 4, hy + 4, 4, 4);
+            }
 
-        // Hunger bar (10 icons on right)
-        for (let i = 0; i < 10; i++) {
-            const fx = hotbarX + hotbarW - (i + 1) * 24 + 4;
-            const fy = hotbarY - 34;
-            ctx.fillStyle = '#000000';
-            ctx.fillRect(fx, fy, 20, 20);
-            ctx.fillStyle = (i * 2 + 1) <= params.hunger ? '#c67d30' : '#2e1d0c';
-            ctx.fillRect(fx + 2, fy + 2, 16, 16);
-        }
+            // Hunger bar (10 icons on right)
+            for (let i = 0; i < 10; i++) {
+                const fx = hotbarX + hotbarW - (i + 1) * 24 + 4;
+                const fy = hotbarY - 34;
+                ctx.fillStyle = '#000000';
+                ctx.fillRect(fx, fy, 20, 20);
+                ctx.fillStyle = (i * 2 + 1) <= params.hunger ? '#c67d30' : '#2e1d0c';
+                ctx.fillRect(fx + 2, fy + 2, 16, 16);
+            }
 
-        // Experience bar
-        ctx.fillStyle = '#111111';
-        ctx.fillRect(hotbarX, hotbarY - 11, hotbarW, 7);
-        ctx.fillStyle = '#7efc20';
-        ctx.fillRect(hotbarX + 1, hotbarY - 10, Math.floor((hotbarW - 2) * 0.65), 5);
-        this.drawShadowedText(String(params.xpLevel), cx - 6, hotbarY - 14, '#80ff20', 16);
+            // Experience bar
+            ctx.fillStyle = '#111111';
+            ctx.fillRect(hotbarX, hotbarY - 11, hotbarW, 7);
+            ctx.fillStyle = '#7efc20';
+            ctx.fillRect(hotbarX + 1, hotbarY - 10, Math.floor((hotbarW - 2) * 0.65), 5);
+            this.drawShadowedText(String(params.xpLevel), cx - 6, hotbarY - 14, '#80ff20', 16);
+        }
 
         // 4. 9-Slot Hotbar
         ctx.fillStyle = 'rgba(20, 20, 24, 0.85)';
@@ -6417,12 +7325,26 @@ class DualRenderEngine {
             this.drawShadowedText(label, cx - label.length * 4.5, hotbarY - 56, '#ffffff', 16);
         }
 
-        // 5. F3 Debug Screen (`Minecraft 26.3 (26.3/vanilla)`)
+        // 5. Directional Audio Subtitles Box (bottom-right above hotbar when Show Subtitles: ON)
+        if (params.subtitles && params.subtitles.length > 0) {
+            let sy = h - 110;
+            for (const sub of params.subtitles) {
+                const label = `${sub.dir === '<' ? '< ' : '  '}${sub.text}${sub.dir === '>' ? ' >' : '  '}`;
+                const boxW = Math.max(160, label.length * 9 + 18);
+                const bx = w - boxW - 16;
+                ctx.fillStyle = 'rgba(16, 16, 20, 0.78)';
+                ctx.fillRect(bx, sy, boxW, 24);
+                this.drawShadowedText(label, bx + 9, sy + 17, '#ffffff', 14);
+                sy -= 26;
+            }
+        }
+
+        // 6. F3 Debug Screen (`Minecraft 26.3 (26.3/vanilla)`)
         if (params.showF3Debug) {
             const leftLines = [
                 `Minecraft 26.3 (26.3/vanilla - Protocol 777, DataVersion 5023)`,
                 `${params.fps} fps | Backend: ${this.backend} | C: ${this.renderedChunksCount}/${this.renderedChunksCount + this.culledChunksCount} (F: ${this.culledChunksCount}) | V: ${this.totalGpuVertices}`,
-                `Thr: ${params.workerStatus} | WASM: mc26_3_core.wasm + epoxy.wasm`,
+                `Thr: ${params.workerStatus} | WASM: mc26_3_core.wasm + epoxy.wasm | TeaVM Bytecode PAL`,
                 `XYZ: ${params.playerX.toFixed(3)} / ${params.playerY.toFixed(5)} / ${params.playerZ.toFixed(3)}`,
                 `Block: ${Math.floor(params.playerX)} ${Math.floor(params.playerY)} ${Math.floor(params.playerZ)} | Chunk: ${Math.floor(params.playerX) >> 4} ${Math.floor(params.playerY) >> 4} ${Math.floor(params.playerZ) >> 4}`,
                 `Facing: Yaw ${params.yawDeg.toFixed(1)} / Pitch ${params.pitchDeg.toFixed(1)}`,
@@ -6451,21 +7373,2882 @@ class DualRenderEngine {
 }
 
 
+// --- Module: gui/vanilla_screens.ts ---
+/**
+ * Authentic Vanilla Minecraft 26.3 GUI Screen Hierarchy (`net.minecraft.client.gui.screens.*`)
+ *
+ * Driven by the decompiled/transpiled JVM Classfile v69.0 metadata in `bytecode_gui.json`
+ * and rendered with authentic Mojang sprites (`assets/gui/*.png`), 6-face rotating blurred
+ * Panorama cubemap (`panorama_0.png`..`panorama_5.png`), `splashes.txt`, and 143-language `I18n`.
+ */
+
+
+
+
+               
+            
+             
+                    
+                    
+                         
+                         
+                           
+                        
+                   
+                  
+                            
+                     
+                   
+              
+               
+                      
+                     
+                
+                      
+                
+                       
+                      
+                          
+                    
+                             
+               
+                    
+             
+                    
+                  
+                    
+                           
+
+                        
+                                                                
+                                          
+                                                                           
+                                                                       
+                                            
+                                    
+                                                
+                                         
+                                         
+                                             
+                                                                                                         
+                                                                                                                              
+                                                                                                              
+ 
+
+class VanillaScreenManager {
+                    pal                          ;
+                    callbacks              ;
+                    rootEl             ;
+                     bgCanvas                   ;
+                     bgCtx                          ;
+
+           activeScreen           = 'title';
+           screenStack             = [];
+           inWorld = false;
+
+    // SplashOverlay / LoadingOverlay state (`net.minecraft.client.gui.screens.LoadingOverlay`)
+           splashActive = true;
+           splashProgress = 0;
+           splashTargetProgress = 0;
+           splashStageText = 'Bootstrap: Loading JVM Classfile v69.0 Bytecode...';
+           splashFadeAlpha = 1.0;
+           splashFadingOut = false;
+            mojangLogoImg                          = null;
+            panoramaImgs                     = [];
+
+    // TitleScreen state (`net.minecraft.client.gui.screens.TitleScreen`)
+            currentSplashText = '1:1 Web Port!';
+            splashTextEl                     = null;
+            panoramaStartTime = performance.now();
+
+    // SelectWorldScreen & CreateWorldScreen draft state
+            selectedWorldId = '';
+            createTab                            = 'game';
+            draftWorld                    ;
+            keybindListeningId                = null;
+
+    // Multiplayer saved servers list
+            servers                                                                          = [
+        { name: 'Minecraft 26.3 Official Test Relay', address: 'mc.hypixel.net:25565', motd: 'Minecraft 26.3 Protocol 777 via Wisp/Epoxy' },
+        { name: 'Local 26.3 LAN Server', address: '127.0.0.1:25565', motd: 'Localhost Protocol 777 Server' },
+    ];
+            selectedServerIdx = 0;
+            wispServerUrl = 'wss://anura.pro/';
+            mpUsername = 'Player26_3';
+            lanPort                = null;
+
+    // LevelLoadingScreen progress state
+           levelLoadProgress = 0;
+           levelLoadStage = 'Preparing spawn area: 0%';
+
+    constructor(pal                          , callbacks              , rootEl             , bgCanvas                   ) {
+        this.pal = pal;
+        this.callbacks = callbacks;
+        this.rootEl = rootEl;
+        this.bgCanvas = bgCanvas;
+        this.bgCtx = bgCanvas.getContext('2d') ;
+        this.resetDraftWorld();
+        this.installGlobalListeners();
+    }
+
+           async loadGuiTextures()                {
+        const loadImg = (src        )                                   =>
+            new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => resolve(null);
+                img.src = src;
+            });
+
+        this.mojangLogoImg = await loadImg('assets/gui/mojangstudios.png');
+        const panos = await Promise.all([
+            loadImg('assets/gui/panorama_0.png'),
+            loadImg('assets/gui/panorama_1.png'),
+            loadImg('assets/gui/panorama_2.png'),
+            loadImg('assets/gui/panorama_3.png'),
+            loadImg('assets/gui/panorama_4.png'),
+            loadImg('assets/gui/panorama_5.png'),
+        ]);
+        this.panoramaImgs = panos.filter((p)                        => p !== null);
+        this.pickRandomSplash();
+    }
+
+           pickRandomSplash()       {
+        const list = this.pal.bytecodeBundle?.splashes || ['Minecraft 26.3!'];
+        if (list.length > 0) {
+            this.currentSplashText = list[Math.floor(Math.random() * list.length)];
+        }
+    }
+
+           setSplashProgress(pct        , stageText        )       {
+        this.splashTargetProgress = Math.max(0, Math.min(100, pct));
+        this.splashStageText = stageText;
+        if (pct >= 100 && !this.splashFadingOut) {
+            this.splashProgress = 100;
+            this.splashFadingOut = true;
+        }
+    }
+
+           triggerResourceReloadSplash(stageText        , onComplete             )       {
+        this.splashActive = true;
+        this.splashFadingOut = false;
+        this.splashFadeAlpha = 1.0;
+        this.splashProgress = 15;
+        this.splashTargetProgress = 100;
+        this.splashStageText = stageText;
+        setTimeout(() => {
+            this.splashProgress = 100;
+            this.splashFadingOut = true;
+            if (onComplete) onComplete();
+            this.renderCurrentScreenDom();
+        }, 420);
+    }
+
+           resetDraftWorld(template                    )       {
+        const defaultRules                                   = {};
+        for (const gr of this.pal.bytecodeBundle?.gameRules || []) {
+            defaultRules[gr.id] = gr.defaultValue;
+        }
+        if (template) {
+            this.draftWorld = JSON.parse(JSON.stringify(template));
+            this.draftWorld.id = `world_${Date.now()}`;
+            this.draftWorld.name = `${template.name} (Copy)`;
+            this.draftWorld.folderName = this.draftWorld.name;
+            this.draftWorld.lastPlayedMs = Date.now();
+            this.draftWorld.createdMs = Date.now();
+            return;
+        }
+        this.draftWorld = {
+            id: `world_${Date.now()}`,
+            folderName: 'New World',
+            name: 'New World',
+            lastPlayedMs: Date.now(),
+            createdMs: Date.now(),
+            gameMode: 'survival',
+            difficulty: 'normal',
+            difficultyLocked: false,
+            allowCommands: false,
+            worldType: 'normal',
+            seed: '',
+            generateStructures: true,
+            bonusChest: false,
+            flatLayers: [
+                { block: 'minecraft:bedrock', height: 1 },
+                { block: 'minecraft:dirt', height: 2 },
+                { block: 'minecraft:grass_block', height: 1 },
+            ],
+            flatBiome: 'minecraft:plains',
+            singleBiome: 'minecraft:pale_garden',
+            experiments: ['vanilla'],
+            dataPacks: ['vanilla'],
+            gameRules: defaultRules,
+            versionName: '26.3',
+            protocolVersion: 777,
+            dataVersion: 5023,
+            iconColor1: '#59ae30',
+            iconColor2: '#7a5838',
+        };
+    }
+
+           openScreen(screen          , pushHistory = true)       {
+        if (pushHistory && this.activeScreen !== 'none' && this.activeScreen !== screen) {
+            this.screenStack.push(this.activeScreen);
+        }
+        this.activeScreen = screen;
+        this.keybindListeningId = null;
+        if (screen !== 'none' && document.pointerLockElement) {
+            document.exitPointerLock();
+        }
+        if (screen === 'title') {
+            this.inWorld = false;
+            this.screenStack = [];
+            this.pickRandomSplash();
+        }
+        this.renderCurrentScreenDom();
+    }
+
+           navigateBack()       {
+        const prev = this.screenStack.pop();
+        if (prev) {
+            this.activeScreen = prev;
+        } else if (this.inWorld) {
+            this.activeScreen = 'none';
+        } else {
+            this.activeScreen = 'title';
+        }
+        this.keybindListeningId = null;
+        this.renderCurrentScreenDom();
+    }
+
+            playClick()       {
+        this.pal.audio.playSoundEvent('ui.button.click', SoundSource.MASTER, 0, 0, 0, 0.7, 1.0, false);
+    }
+
+            installGlobalListeners()       {
+        // Global key listener for KeyBindsScreen rebinding and Escape navigation
+        window.addEventListener('keydown', (e) => {
+            if (this.keybindListeningId) {
+                e.preventDefault();
+                e.stopPropagation();
+                const kb = this.pal.options.keyBinds.find(k => k.id === this.keybindListeningId);
+                if (kb) {
+                    kb.boundCode = e.code === 'Escape' ? 'Unbound' : e.code;
+                    this.pal.saveOptions();
+                }
+                this.keybindListeningId = null;
+                this.playClick();
+                this.renderCurrentScreenDom();
+                return;
+            }
+            if (e.code === 'Escape' && !this.splashActive) {
+                if (this.activeScreen === 'none' && this.inWorld) {
+                    e.preventDefault();
+                    this.openScreen('pause', false);
+                } else if (this.activeScreen === 'pause' || this.activeScreen === 'creative_inventory') {
+                    e.preventDefault();
+                    this.openScreen('none', false);
+                } else if (this.activeScreen !== 'title' && this.activeScreen !== 'level_loading') {
+                    e.preventDefault();
+                    this.navigateBack();
+                }
+            }
+        }, true);
+
+        // Drag-and-drop custom .zip Resource Packs anywhere on PackSelectionScreen
+        window.addEventListener('dragover', (e) => {
+            if (this.activeScreen === 'pack_selection') {
+                e.preventDefault();
+            }
+        });
+        window.addEventListener('drop', async (e) => {
+            if (this.activeScreen !== 'pack_selection') return;
+            e.preventDefault();
+            const files = e.dataTransfer?.files;
+            if (!files || files.length === 0) return;
+            for (let i = 0; i < files.length; i++) {
+                const f = files[i];
+                if (f.name.toLowerCase().endsWith('.zip')) {
+                    await this.pal.importZipResourcePack(f);
+                }
+            }
+            this.playClick();
+            this.renderCurrentScreenDom();
+        });
+    }
+
+    /**
+     * Called every animation frame (`requestAnimationFrame`) to render:
+     * 1. The rotating 6-face Panorama Cubemap skybox (when on TitleScreen or out-of-world menus)
+     * 2. Sinusoidal splash text bounce on `TitleScreen`
+     * 3. `LoadingOverlay` (`SplashOverlay`) Mojang Studios red boot screen & alpha fade-out
+     */
+           renderFrame(nowMs        )       {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        if (this.bgCanvas.width !== w || this.bgCanvas.height !== h) {
+            this.bgCanvas.width = w;
+            this.bgCanvas.height = h;
+        }
+
+        const ctx = this.bgCtx;
+        ctx.clearRect(0, 0, w, h);
+
+        // 1. Render 6-Face Rotating Panorama Cubemap when not in world
+        if (!this.inWorld && this.activeScreen !== 'none') {
+            this.renderPanoramaBackground(ctx, w, h, nowMs);
+        }
+
+        // 2. Animate TitleScreen bouncing yellow splash text: scale = 1.8 - abs(sin(time) * 0.1)
+        if (this.activeScreen === 'title' && this.splashTextEl) {
+            const t = (nowMs % 1000) / 1000.0;
+            const bounce = 1.0 - Math.abs(Math.sin(t * Math.PI * 2.0) * 0.09);
+            this.splashTextEl.style.transform = `rotate(-20deg) scale(${bounce.toFixed(4)})`;
+        }
+
+        // 3. Render SplashOverlay (`net.minecraft.client.gui.screens.LoadingOverlay`) if active
+        if (this.splashActive) {
+            if (this.splashProgress < this.splashTargetProgress) {
+                this.splashProgress = Math.min(this.splashTargetProgress, this.splashProgress + 2.8);
+            }
+            if (this.splashFadingOut) {
+                this.splashFadeAlpha -= 0.045;
+                if (this.splashFadeAlpha <= 0) {
+                    this.splashFadeAlpha = 0;
+                    this.splashActive = false;
+                    return;
+                }
+            }
+            this.renderSplashOverlay(ctx, w, h);
+        }
+    }
+
+            renderPanoramaBackground(ctx                          , w        , h        , nowMs        )       {
+        const elapsedSec = ((nowMs - this.panoramaStartTime) / 1000.0) * this.pal.options.panoramaScrollSpeed;
+        ctx.save();
+        if (this.activeScreen !== 'title' && this.pal.options.menuBackgroundBlurriness > 0) {
+            ctx.filter = `blur(${this.pal.options.menuBackgroundBlurriness}px) brightness(0.55)`;
+        } else if (this.activeScreen === 'title') {
+            ctx.filter = 'blur(1.5px)';
+        }
+
+        if (this.panoramaImgs.length >= 4) {
+            // Render seamless 360-degree cylindrical projection of the 4 horizontal panorama cubemap faces (0, 1, 2, 3)
+            const faceCount = 4;
+            const stripW = Math.max(w * 0.65, h * 1.15);
+            const totalW = stripW * faceCount;
+            const scrollX = (elapsedSec * 28) % totalW;
+            const bobY = Math.sin(elapsedSec * 0.35) * (h * 0.06);
+
+            for (let i = 0; i < faceCount + 2; i++) {
+                const faceIdx = i % faceCount;
+                const img = this.panoramaImgs[faceIdx];
+                const dx = Math.floor(i * stripW - scrollX);
+                if (dx > w || dx + stripW < 0) continue;
+                ctx.drawImage(img, 0, 0, img.width, img.height, dx - 2, -h * 0.08 + bobY, stripW + 4, h * 1.16);
+            }
+        } else {
+            const grad = ctx.createLinearGradient(0, 0, 0, h);
+            grad.addColorStop(0, '#5a78a8');
+            grad.addColorStop(1, '#3b5230');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, w, h);
+        }
+        ctx.restore();
+
+        // Vanilla panorama_overlay gradient
+        const grad = ctx.createLinearGradient(0, 0, 0, h);
+        grad.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
+        grad.addColorStop(1, this.activeScreen === 'title' ? 'rgba(0, 0, 0, 0.28)' : 'rgba(0, 0, 0, 0.58)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, w, h);
+    }
+
+    /**
+     * Authentic `net.minecraft.client.gui.screens.LoadingOverlay` (`SplashOverlay`) renderer:
+     * - Exact `#EF323D` Mojang Red background (or `#000000` Monochrome Logo mode)
+     * - Centered `mojangstudios.png` logo
+     * - Horizontal progress bar tracking reloadable resource manager stages
+     */
+            renderSplashOverlay(ctx                          , w        , h        )       {
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, this.splashFadeAlpha));
+        ctx.fillStyle = this.pal.options.darkMojangStudiosBackground ? '#000000' : '#EF323D';
+        ctx.fillRect(0, 0, w, h);
+
+        const cx = Math.floor(w / 2);
+        const cy = Math.floor(h / 2);
+
+        if (this.mojangLogoImg) {
+            // mojangstudios.png is 512x512 split into left half (top 512x256) and right half (bottom 512x256) in vanilla!
+            const logoH = Math.min(140, Math.floor(h * 0.22));
+            const halfW = logoH * 2;
+            ctx.drawImage(this.mojangLogoImg, 0, 0, 512, 256, cx - halfW, cy - Math.floor(logoH / 2) - 20, halfW, logoH);
+            ctx.drawImage(this.mojangLogoImg, 0, 256, 512, 256, cx, cy - Math.floor(logoH / 2) - 20, halfW, logoH);
+        } else {
+            ctx.font = 'bold 42px "Courier New", monospace';
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.fillText('MOJANG STUDIOS', cx, cy - 10);
+        }
+
+        // Horizontal loading progress bar (vanilla dimensions & white 2px border)
+        const barW = Math.min(460, Math.floor(w * 0.62));
+        const barH = 14;
+        const barX = cx - Math.floor(barW / 2);
+        const barY = Math.floor(h * 0.80);
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(barX, barY, barW, barH);
+
+        const fillW = Math.floor(((barW - 6) * this.splashProgress) / 100);
+        if (fillW > 0) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(barX + 3, barY + 3, fillW, barH - 6);
+        }
+
+        ctx.font = 'bold 13px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+        ctx.textAlign = 'center';
+        ctx.fillText(this.splashStageText, cx, barY + 30);
+        ctx.restore();
+    }
+
+    /**
+     * Renders the active screen hierarchy (`net.minecraft.client.gui.screens.*`) into `rootEl`.
+     */
+           renderCurrentScreenDom()       {
+        const t = (k        , ...args                        ) => this.pal.translate(k, ...args);
+        this.rootEl.innerHTML = '';
+        this.splashTextEl = null;
+
+        if (this.activeScreen === 'none') {
+            this.rootEl.style.pointerEvents = 'none';
+            return;
+        }
+        this.rootEl.style.pointerEvents = 'auto';
+
+        const scaleFactor = this.pal.options.guiScale === 1 ? 0.82
+            : this.pal.options.guiScale === 2 ? 0.92
+            : this.pal.options.guiScale === 4 ? 1.15
+            : 1.0;
+        this.rootEl.style.setProperty('--mc-gui-scale', String(scaleFactor));
+
+        switch (this.activeScreen) {
+            case 'title':
+                this.buildTitleScreen(t);
+                break;
+            case 'select_world':
+                this.buildSelectWorldScreen(t);
+                break;
+            case 'create_world':
+                this.buildCreateWorldScreen(t);
+                break;
+            case 'create_flat_world':
+                this.buildCreateFlatWorldScreen(t);
+                break;
+            case 'preset_flat_world':
+                this.buildPresetFlatWorldScreen(t);
+                break;
+            case 'create_buffet_world':
+                this.buildCreateBuffetWorldScreen(t);
+                break;
+            case 'world_game_rules':
+                this.buildGameRulesScreen(t);
+                break;
+            case 'experiments':
+                this.buildExperimentsScreen(t);
+                break;
+            case 'edit_world':
+                this.buildEditWorldScreen(t);
+                break;
+            case 'confirm_delete_world':
+                this.buildConfirmDeleteWorldScreen(t);
+                break;
+            case 'level_loading':
+                this.buildLevelLoadingScreen(t);
+                break;
+            case 'multiplayer':
+                this.buildMultiplayerScreen(t);
+                break;
+            case 'realms':
+                this.buildRealmsScreen(t);
+                break;
+            case 'options':
+                this.buildOptionsScreen(t);
+                break;
+            case 'video_settings':
+                this.buildVideoSettingsScreen(t);
+                break;
+            case 'sound_options':
+                this.buildSoundOptionsScreen(t);
+                break;
+            case 'controls':
+                this.buildControlsScreen(t);
+                break;
+            case 'mouse_settings':
+                this.buildMouseSettingsScreen(t);
+                break;
+            case 'keybinds':
+                this.buildKeyBindsScreen(t);
+                break;
+            case 'language_select':
+                this.buildLanguageSelectScreen(t);
+                break;
+            case 'pack_selection':
+                this.buildPackSelectionScreen(t);
+                break;
+            case 'skin_customization':
+                this.buildSkinCustomizationScreen(t);
+                break;
+            case 'chat_options':
+                this.buildChatOptionsScreen(t);
+                break;
+            case 'accessibility_options':
+                this.buildAccessibilityOptionsScreen(t);
+                break;
+            case 'credits':
+                this.buildCreditsScreen(t);
+                break;
+            case 'confirm_quit':
+                this.buildConfirmQuitScreen(t);
+                break;
+            case 'pause':
+                this.buildPauseScreen(t);
+                break;
+            case 'advancements':
+                this.buildAdvancementsScreen(t);
+                break;
+            case 'statistics':
+                this.buildStatisticsScreen(t);
+                break;
+            case 'share_to_lan':
+                this.buildShareToLanScreen(t);
+                break;
+            case 'creative_inventory':
+                this.buildCreativeInventoryScreen(t);
+                break;
+        }
+    }
+
+    // =========================================================================
+    // WIDGET BUILDER HELPERS (Authentic Mojang Sprites & Pixel Typography)
+    // =========================================================================
+
+            createButton(label        , onClick            , widthPx = 200, disabled = false)                    {
+        const btn = document.createElement('button');
+        btn.className = 'mc-widget-btn';
+        btn.style.width = `${widthPx}px`;
+        btn.disabled = disabled;
+        btn.textContent = label;
+        btn.addEventListener('click', () => {
+            if (disabled) return;
+            this.playClick();
+            onClick();
+        });
+        return btn;
+    }
+
+            createIconButton(iconUrl        , title        , onClick            )                    {
+        const btn = document.createElement('button');
+        btn.className = 'mc-widget-btn mc-icon-btn';
+        btn.title = title;
+        const img = document.createElement('img');
+        img.src = iconUrl;
+        img.alt = title;
+        btn.appendChild(img);
+        btn.addEventListener('click', () => {
+            this.playClick();
+            onClick();
+        });
+        return btn;
+    }
+
+            createSlider(
+        formatLabel                         ,
+        min        ,
+        max        ,
+        step        ,
+        initialValue        ,
+        onChange                       ,
+        widthPx = 150
+    )              {
+        const wrap = document.createElement('div');
+        wrap.className = 'mc-slider-wrap';
+        wrap.style.width = `${widthPx}px`;
+
+        const fill = document.createElement('div');
+        fill.className = 'mc-slider-handle';
+
+        const lbl = document.createElement('span');
+        lbl.className = 'mc-slider-label';
+
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.className = 'mc-slider-input';
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = String(initialValue);
+
+        const updateVisual = (v        ) => {
+            const pct = max > min ? ((v - min) / (max - min)) * 100 : 0;
+            fill.style.left = `calc(${pct}% - ${Math.round((pct / 100) * 8)}px)`;
+            lbl.textContent = formatLabel(v);
+        };
+        updateVisual(initialValue);
+
+        input.addEventListener('input', () => {
+            const v = parseFloat(input.value);
+            updateVisual(v);
+            onChange(v);
+        });
+        input.addEventListener('change', () => {
+            this.pal.saveOptions();
+        });
+
+        wrap.appendChild(fill);
+        wrap.appendChild(lbl);
+        wrap.appendChild(input);
+        return wrap;
+    }
+
+            createScreenFrame(titleText        , bytecodeClass        )   
+                               
+                          
+                            
+      {
+        const container = document.createElement('div');
+        container.className = `mc-screen-frame ${this.inWorld ? 'mc-inworld-bg' : 'mc-menu-bg'}`;
+
+        const header = document.createElement('div');
+        header.className = 'mc-screen-header';
+        const titleEl = document.createElement('div');
+        titleEl.className = 'mc-screen-title';
+        titleEl.textContent = titleText;
+        header.appendChild(titleEl);
+
+        const clsMeta = this.pal.getClassMeta(bytecodeClass);
+        if (clsMeta) {
+            const badge = document.createElement('div');
+            badge.className = 'mc-bytecode-badge';
+            badge.textContent = `${clsMeta.className.replace(/\//g, '.')} • JVM v${clsMeta.majorVersion}.0 (${clsMeta.methods.length} methods, ${clsMeta.totalBytecodeInstructions}B bytecode)`;
+            header.appendChild(badge);
+        }
+
+        const body = document.createElement('div');
+        body.className = 'mc-screen-body';
+
+        const footer = document.createElement('div');
+        footer.className = 'mc-screen-footer';
+
+        container.appendChild(header);
+        container.appendChild(body);
+        container.appendChild(footer);
+        this.rootEl.appendChild(container);
+        return { container, body, footer };
+    }
+
+    // =========================================================================
+    // 1. VANILLA TITLE SCREEN (`net.minecraft.client.gui.screens.TitleScreen`)
+    // =========================================================================
+
+            buildTitleScreen(t                                                        )       {
+        const wrap = document.createElement('div');
+        wrap.className = 'mc-title-screen';
+
+        // Logo block: minecraft.png + edition.png + bouncing yellow splash text
+        const logoBox = document.createElement('div');
+        logoBox.className = 'mc-title-logo-box';
+
+        const mcLogo = document.createElement('img');
+        mcLogo.src = 'assets/gui/minecraft.png';
+        mcLogo.className = 'mc-title-logo-img';
+        mcLogo.alt = 'Minecraft';
+        logoBox.appendChild(mcLogo);
+
+        const editionLogo = document.createElement('img');
+        editionLogo.src = 'assets/gui/edition.png';
+        editionLogo.className = 'mc-title-edition-img';
+        editionLogo.alt = 'Java Edition';
+        logoBox.appendChild(editionLogo);
+
+        if (!this.pal.options.hideSplashTexts) {
+            const splash = document.createElement('div');
+            splash.className = 'mc-title-splash';
+            splash.textContent = this.currentSplashText;
+            this.splashTextEl = splash;
+            logoBox.appendChild(splash);
+        }
+        wrap.appendChild(logoBox);
+
+        // Main button stack: Singleplayer, Multiplayer, Minecraft Realms
+        const menuStack = document.createElement('div');
+        menuStack.className = 'mc-title-buttons';
+
+        menuStack.appendChild(this.createButton(t('menu.singleplayer'), () => this.openScreen('select_world'), 200));
+        menuStack.appendChild(this.createButton(t('menu.multiplayer'), () => this.openScreen('multiplayer'), 200));
+        menuStack.appendChild(this.createButton(t('menu.online'), () => this.openScreen('realms'), 200));
+
+        // Bottom button row: Language icon | Options... | Quit Game | Accessibility icon
+        const bottomRow = document.createElement('div');
+        bottomRow.className = 'mc-title-bottom-row';
+
+        bottomRow.appendChild(
+            this.createIconButton('assets/gui/language.png', t('options.language'), () => this.openScreen('language_select'))
+        );
+        bottomRow.appendChild(this.createButton(t('menu.options'), () => this.openScreen('options'), 98));
+        bottomRow.appendChild(this.createButton(t('menu.quit'), () => this.openScreen('confirm_quit'), 98));
+        bottomRow.appendChild(
+            this.createIconButton('assets/gui/accessibility.png', t('options.accessibility'), () => this.openScreen('accessibility_options'))
+        );
+        menuStack.appendChild(bottomRow);
+        wrap.appendChild(menuStack);
+
+        // Bottom-left version text & Bottom-right Mojang copyright notice
+        const verLeft = document.createElement('div');
+        verLeft.className = 'mc-title-corner-left';
+        verLeft.textContent = 'Minecraft 26.3 (26.3/vanilla)';
+        wrap.appendChild(verLeft);
+
+        const copyRight = document.createElement('div');
+        copyRight.className = 'mc-title-corner-right';
+        copyRight.textContent = t('title.credits');
+        copyRight.title = t('options.credits_and_attribution');
+        copyRight.addEventListener('click', () => {
+            this.playClick();
+            this.openScreen('credits');
+        });
+        wrap.appendChild(copyRight);
+
+        this.rootEl.appendChild(wrap);
+    }
+
+    // =========================================================================
+    // 2. SINGLEPLAYER WORLD SELECTION (`SelectWorldScreen` & `EditWorldScreen`)
+    // =========================================================================
+
+            buildSelectWorldScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('selectWorld.title'),
+            'net/minecraft/client/gui/screens/worldselection/SelectWorldScreen'
+        );
+
+        if (!this.selectedWorldId && this.pal.savedWorlds.length > 0) {
+            this.selectedWorldId = this.pal.savedWorlds[0].id;
+        }
+
+        // Search input box
+        const searchRow = document.createElement('div');
+        searchRow.style.marginBottom = '8px';
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.className = 'mc-text-field';
+        searchInput.style.width = '320px';
+        searchInput.placeholder = t('selectWorld.search');
+        searchRow.appendChild(searchInput);
+        body.appendChild(searchRow);
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        body.appendChild(listBox);
+
+        const hasSel = () => this.pal.savedWorlds.some(w => w.id === this.selectedWorldId);
+        const getSel = () => this.pal.savedWorlds.find(w => w.id === this.selectedWorldId);
+
+        const playBtn = this.createButton(t('selectWorld.select'), () => {
+            const w = getSel();
+            if (w) this.launchWorldWithLoadingScreen(w);
+        }, 150, !hasSel());
+
+        const editBtn = this.createButton(t('selectWorld.edit'), () => {
+            if (getSel()) this.openScreen('edit_world');
+        }, 72, !hasSel());
+
+        const deleteBtn = this.createButton(t('selectWorld.delete'), () => {
+            if (getSel()) this.openScreen('confirm_delete_world');
+        }, 72, !hasSel());
+
+        const recreateBtn = this.createButton(t('selectWorld.recreate'), () => {
+            const w = getSel();
+            if (w) {
+                this.resetDraftWorld(w);
+                this.createTab = 'game';
+                this.openScreen('create_world');
+            }
+        }, 72, !hasSel());
+
+        const renderWorldEntries = (query        ) => {
+            listBox.innerHTML = '';
+            const q = query.trim().toLowerCase();
+            const filtered = this.pal.savedWorlds.filter(
+                w => !q || w.name.toLowerCase().includes(q) || w.folderName.toLowerCase().includes(q)
+            );
+            for (const w of filtered) {
+                const row = document.createElement('div');
+                row.className = `mc-world-entry ${w.id === this.selectedWorldId ? 'selected' : ''}`;
+
+                // 64x64 procedural world icon
+                const icon = document.createElement('div');
+                icon.className = 'mc-world-icon';
+                icon.style.background = `linear-gradient(180deg, #78a7ff 0%, #78a7ff 45%, ${w.iconColor1} 45%, ${w.iconColor1} 62%, ${w.iconColor2} 62%, ${w.iconColor2} 100%)`;
+
+                const info = document.createElement('div');
+                info.className = 'mc-world-info';
+                const dateStr = new Date(w.lastPlayedMs).toLocaleString();
+                const modeLabel = w.gameMode === 'hardcore'
+                    ? `${t('gameMode.hardcore')}!`
+                    : w.gameMode === 'creative'
+                        ? t('gameMode.creative')
+                        : t('gameMode.survival');
+                const cheatsStr = w.allowCommands ? `, ${t('selectWorld.cheats')}` : '';
+                info.innerHTML = `
+                    <div class="mc-world-title">${w.name}</div>
+                    <div class="mc-world-sub">${w.folderName} (${dateStr})</div>
+                    <div class="mc-world-sub">${modeLabel}${cheatsStr}, ${t('selectWorld.version')} ${w.versionName} (${w.worldType})</div>
+                `;
+
+                row.appendChild(icon);
+                row.appendChild(info);
+                row.addEventListener('click', () => {
+                    this.selectedWorldId = w.id;
+                    this.playClick();
+                    renderWorldEntries(searchInput.value);
+                    playBtn.disabled = false;
+                    editBtn.disabled = false;
+                    deleteBtn.disabled = false;
+                    recreateBtn.disabled = false;
+                });
+                row.addEventListener('dblclick', () => {
+                    this.launchWorldWithLoadingScreen(w);
+                });
+                listBox.appendChild(row);
+            }
+        };
+
+        searchInput.addEventListener('input', () => renderWorldEntries(searchInput.value));
+        renderWorldEntries('');
+
+        // Footer 2-row button bar matching vanilla SelectWorldScreen
+        const row1 = document.createElement('div');
+        row1.className = 'mc-btn-row';
+        row1.appendChild(playBtn);
+        row1.appendChild(this.createButton(t('selectWorld.create'), () => {
+            this.resetDraftWorld();
+            this.createTab = 'game';
+            this.openScreen('create_world');
+        }, 150));
+
+        const row2 = document.createElement('div');
+        row2.className = 'mc-btn-row';
+        row2.appendChild(editBtn);
+        row2.appendChild(deleteBtn);
+        row2.appendChild(recreateBtn);
+        row2.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 72));
+
+        footer.style.flexDirection = 'column';
+        footer.appendChild(row1);
+        footer.appendChild(row2);
+    }
+
+            buildEditWorldScreen(t                                                        )       {
+        const world = this.pal.savedWorlds.find(w => w.id === this.selectedWorldId);
+        if (!world) {
+            this.navigateBack();
+            return;
+        }
+        const { body, footer } = this.createScreenFrame(
+            t('selectWorld.edit.title'),
+            'net/minecraft/client/gui/screens/worldselection/EditWorldScreen'
+        );
+
+        const form = document.createElement('div');
+        form.className = 'mc-form-stack';
+
+        const lbl = document.createElement('div');
+        lbl.textContent = t('selectWorld.enterName');
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.className = 'mc-text-field';
+        nameInput.style.width = '300px';
+        nameInput.value = world.name;
+        form.appendChild(lbl);
+        form.appendChild(nameInput);
+
+        const statusMsg = document.createElement('div');
+        statusMsg.style.color = '#7efc20';
+        statusMsg.style.minHeight = '18px';
+
+        form.appendChild(this.createButton(t('selectWorld.edit.resetIcon'), () => {
+            world.iconColor1 = '#59ae30';
+            world.iconColor2 = '#7a5838';
+            statusMsg.textContent = 'World icon reset to default.';
+        }, 200));
+
+        form.appendChild(this.createButton(t('selectWorld.edit.backup'), () => {
+            const blob = new Blob([JSON.stringify(world, null, 2)], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `${world.folderName}_backup_26_3.json`;
+            a.click();
+            statusMsg.textContent = `Exported backup: ${world.folderName}_backup_26_3.json`;
+        }, 200));
+
+        form.appendChild(this.createButton(t('selectWorld.edit.optimize'), () => {
+            world.dataVersion = 5023;
+            statusMsg.textContent = 'Optimized chunks to DataVersion 5023 (Minecraft 26.3).';
+        }, 200));
+
+        form.appendChild(statusMsg);
+        body.appendChild(form);
+
+        footer.appendChild(this.createButton(t('selectWorld.edit.save'), async () => {
+            world.name = nameInput.value.trim() || world.name;
+            await this.pal.persistSavedWorlds();
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+            buildConfirmDeleteWorldScreen(t                                                        )       {
+        const world = this.pal.savedWorlds.find(w => w.id === this.selectedWorldId);
+        if (!world) {
+            this.navigateBack();
+            return;
+        }
+        const { body, footer } = this.createScreenFrame(
+            t('selectWorld.deleteQuestion'),
+            'net/minecraft/client/gui/screens/ConfirmScreen'
+        );
+
+        const warn = document.createElement('div');
+        warn.style.textAlign = 'center';
+        warn.style.maxWidth = '480px';
+        warn.style.lineHeight = '1.6';
+        warn.textContent = `'${world.name}' will be lost forever! (A long time!)`;
+        body.appendChild(warn);
+
+        footer.appendChild(this.createButton(t('selectWorld.deleteButton'), async () => {
+            this.pal.savedWorlds = this.pal.savedWorlds.filter(w => w.id !== world.id);
+            this.selectedWorldId = this.pal.savedWorlds[0]?.id || '';
+            await this.pal.persistSavedWorlds();
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3. CREATE NEW WORLD (`CreateWorldScreen`: Game Tab, World Tab, More Tab)
+    // =========================================================================
+
+            buildCreateWorldScreen(t                                                        )       {
+        const tabClass = this.createTab === 'game'
+            ? 'net/minecraft/client/gui/screens/worldselection/CreateWorldScreen$GameTab'
+            : this.createTab === 'world'
+                ? 'net/minecraft/client/gui/screens/worldselection/CreateWorldScreen$WorldTab'
+                : 'net/minecraft/client/gui/screens/worldselection/CreateWorldScreen$MoreTab';
+
+        const { container, body, footer } = this.createScreenFrame(t('selectWorld.create'), tabClass);
+
+        // Top 3 Tabs: Game | World | More
+        const tabBar = document.createElement('div');
+        tabBar.className = 'mc-tab-bar';
+        const tabs                                                          = [
+            { id: 'game', label: t('createWorld.tab.game.title') },
+            { id: 'world', label: t('createWorld.tab.world.title') },
+            { id: 'more', label: t('createWorld.tab.more.title') },
+        ];
+        for (const tb of tabs) {
+            const tBtn = document.createElement('button');
+            tBtn.className = `mc-tab-btn ${this.createTab === tb.id ? 'active' : ''}`;
+            tBtn.textContent = tb.label;
+            tBtn.addEventListener('click', () => {
+                this.createTab = tb.id;
+                this.playClick();
+                this.renderCurrentScreenDom();
+            });
+            tabBar.appendChild(tBtn);
+        }
+        container.insertBefore(tabBar, body);
+
+        const w = this.draftWorld;
+        const stack = document.createElement('div');
+        stack.className = 'mc-form-stack';
+
+        if (this.createTab === 'game') {
+            // Game Tab: World Name, Game Mode (Survival, Hardcore, Creative), Difficulty + Lock, Allow Commands
+            const nameLbl = document.createElement('div');
+            nameLbl.textContent = t('selectWorld.enterName');
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.className = 'mc-text-field';
+            nameInput.style.width = '240px';
+            nameInput.value = w.name;
+            nameInput.addEventListener('input', () => {
+                w.name = nameInput.value;
+                w.folderName = nameInput.value.trim() || 'New World';
+            });
+            stack.appendChild(nameLbl);
+            stack.appendChild(nameInput);
+
+            const modes                                              = ['survival', 'hardcore', 'creative'];
+            const modeLabel = `${t('selectWorld.gameMode')}: ${t('selectWorld.gameMode.' + w.gameMode)}`;
+            stack.appendChild(this.createButton(modeLabel, () => {
+                const next = modes[(modes.indexOf(w.gameMode) + 1) % modes.length];
+                w.gameMode = next;
+                if (next === 'hardcore') {
+                    w.difficulty = 'hard';
+                    w.difficultyLocked = true;
+                }
+                this.renderCurrentScreenDom();
+            }, 240));
+
+            const diffs                                                 = ['peaceful', 'easy', 'normal', 'hard'];
+            const diffRow = document.createElement('div');
+            diffRow.className = 'mc-btn-row';
+            diffRow.appendChild(this.createButton(
+                `${t('options.difficulty')}: ${t('options.difficulty.' + w.difficulty)}`,
+                () => {
+                    if (w.gameMode === 'hardcore') return;
+                    w.difficulty = diffs[(diffs.indexOf(w.difficulty) + 1) % diffs.length];
+                    this.renderCurrentScreenDom();
+                },
+                212,
+                w.gameMode === 'hardcore'
+            ));
+            diffRow.appendChild(this.createIconButton(
+                w.difficultyLocked ? 'assets/gui/locked_button.png' : 'assets/gui/unlocked_button.png',
+                'Lock Difficulty',
+                () => {
+                    if (w.gameMode === 'hardcore') return;
+                    w.difficultyLocked = !w.difficultyLocked;
+                    this.renderCurrentScreenDom();
+                }
+            ));
+            stack.appendChild(diffRow);
+
+            const cheatsLabel = `${t('selectWorld.allowCommands')}: ${w.allowCommands ? t('options.on') : t('options.off')}`;
+            stack.appendChild(this.createButton(cheatsLabel, () => {
+                if (w.gameMode === 'hardcore') return;
+                w.allowCommands = !w.allowCommands;
+                this.renderCurrentScreenDom();
+            }, 240, w.gameMode === 'hardcore'));
+
+            const desc = document.createElement('div');
+            desc.style.fontSize = '12px';
+            desc.style.color = '#aaaaaa';
+            desc.textContent = t('selectWorld.allowCommands.info');
+            stack.appendChild(desc);
+        } else if (this.createTab === 'world') {
+            // World Tab: World Type (Default, Superflat, Large Biomes, AMPLIFIED, Single Biome, Debug Mode) + Customize, Seed, Structures, Bonus Chest
+            const wTypes                                        = [
+                'normal', 'flat', 'large_biomes', 'amplified', 'single_biome_surface', 'debug_all_block_states'
+            ];
+            const typeRow = document.createElement('div');
+            typeRow.className = 'mc-btn-row';
+            typeRow.appendChild(this.createButton(
+                `${t('selectWorld.mapType')} ${t('generator.minecraft.' + w.worldType)}`,
+                () => {
+                    w.worldType = wTypes[(wTypes.indexOf(w.worldType) + 1) % wTypes.length];
+                    this.renderCurrentScreenDom();
+                },
+                170
+            ));
+            const canCustomize = w.worldType === 'flat' || w.worldType === 'single_biome_surface';
+            typeRow.appendChild(this.createButton(
+                t('selectWorld.customizeType'),
+                () => {
+                    if (w.worldType === 'flat') this.openScreen('create_flat_world');
+                    else if (w.worldType === 'single_biome_surface') this.openScreen('create_buffet_world');
+                },
+                130,
+                !canCustomize
+            ));
+            stack.appendChild(typeRow);
+
+            const seedLbl = document.createElement('div');
+            seedLbl.textContent = t('selectWorld.enterSeed');
+            const seedInput = document.createElement('input');
+            seedInput.type = 'text';
+            seedInput.className = 'mc-text-field';
+            seedInput.style.width = '308px';
+            seedInput.placeholder = t('selectWorld.seedInfo');
+            seedInput.value = w.seed;
+            seedInput.addEventListener('input', () => {
+                w.seed = seedInput.value;
+            });
+            stack.appendChild(seedLbl);
+            stack.appendChild(seedInput);
+
+            stack.appendChild(this.createButton(
+                `${t('selectWorld.mapFeatures')}: ${w.generateStructures ? t('options.on') : t('options.off')}`,
+                () => {
+                    w.generateStructures = !w.generateStructures;
+                    this.renderCurrentScreenDom();
+                },
+                308
+            ));
+
+            stack.appendChild(this.createButton(
+                `${t('selectWorld.bonusItems')}: ${w.bonusChest ? t('options.on') : t('options.off')}`,
+                () => {
+                    if (w.gameMode === 'hardcore') return;
+                    w.bonusChest = !w.bonusChest;
+                    this.renderCurrentScreenDom();
+                },
+                308,
+                w.gameMode === 'hardcore'
+            ));
+        } else {
+            // More Tab: Game Rules..., Experiments..., Data Packs...
+            stack.appendChild(this.createButton(t('selectWorld.gameRules'), () => {
+                this.openScreen('world_game_rules');
+            }, 240));
+            stack.appendChild(this.createButton(t('selectWorld.experiments'), () => {
+                this.openScreen('experiments');
+            }, 240));
+            stack.appendChild(this.createButton(t('selectWorld.dataPacks'), () => {
+                this.openScreen('pack_selection');
+            }, 240));
+        }
+
+        body.appendChild(stack);
+
+        footer.appendChild(this.createButton(t('selectWorld.create'), async () => {
+            if (!w.seed.trim()) {
+                w.seed = String(Math.floor(Math.random() * 900000000) + 100000000);
+            }
+            w.iconColor1 = w.worldType === 'flat' ? '#7cbd46' : w.worldType === 'amplified' ? '#9a9a9a' : '#59ae30';
+            this.pal.savedWorlds.unshift(w);
+            this.selectedWorldId = w.id;
+            await this.pal.persistSavedWorlds();
+            this.launchWorldWithLoadingScreen(w);
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3A. SUPERFLAT CUSTOMIZATION (`CreateFlatWorldScreen` & `PresetFlatWorldScreen`)
+    // =========================================================================
+
+            buildCreateFlatWorldScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('createWorld.customize.flat.title'),
+            'net/minecraft/client/gui/screens/CreateFlatWorldScreen'
+        );
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        let selectedIdx = this.draftWorld.flatLayers.length - 1;
+
+        const renderLayers = () => {
+            listBox.innerHTML = '';
+            // Display top-to-bottom like vanilla CreateFlatWorldScreen
+            for (let i = this.draftWorld.flatLayers.length - 1; i >= 0; i--) {
+                const layer = this.draftWorld.flatLayers[i];
+                const row = document.createElement('div');
+                row.className = `mc-list-row ${i === selectedIdx ? 'selected' : ''}`;
+                row.innerHTML = `
+                    <span><b>${layer.block}</b></span>
+                    <span>${t('createWorld.customize.flat.height')}: <b>${layer.height}</b></span>
+                `;
+                row.addEventListener('click', () => {
+                    selectedIdx = i;
+                    this.playClick();
+                    renderLayers();
+                });
+                listBox.appendChild(row);
+            }
+        };
+        renderLayers();
+        body.appendChild(listBox);
+
+        // Layer editor controls (Add Layer / Edit Height / Remove Layer / Presets)
+        const editRow = document.createElement('div');
+        editRow.className = 'mc-btn-row';
+        editRow.style.marginTop = '8px';
+
+        const blockSelect = document.createElement('select');
+        blockSelect.className = 'mc-text-field';
+        for (const blkName of [
+            'minecraft:grass_block', 'minecraft:dirt', 'minecraft:stone', 'minecraft:deepslate',
+            'minecraft:bedrock', 'minecraft:sand', 'minecraft:sandstone', 'minecraft:water',
+            'minecraft:lava', 'minecraft:snow_block', 'minecraft:obsidian', 'minecraft:sulfur',
+            'minecraft:potent_sulfur', 'minecraft:pale_oak_log', 'minecraft:glowstone', 'minecraft:iron_block'
+        ]) {
+            const opt = document.createElement('option');
+            opt.value = blkName;
+            opt.textContent = blkName;
+            blockSelect.appendChild(opt);
+        }
+
+        const heightInput = document.createElement('input');
+        heightInput.type = 'number';
+        heightInput.className = 'mc-text-field';
+        heightInput.style.width = '64px';
+        heightInput.min = '1';
+        heightInput.max = '128';
+        heightInput.value = '4';
+
+        editRow.appendChild(blockSelect);
+        editRow.appendChild(heightInput);
+        editRow.appendChild(this.createButton('Add Layer', () => {
+            this.draftWorld.flatLayers.push({
+                block: blockSelect.value,
+                height: Math.max(1, Math.min(128, parseInt(heightInput.value, 10) || 1)),
+            });
+            selectedIdx = this.draftWorld.flatLayers.length - 1;
+            renderLayers();
+        }, 95));
+        editRow.appendChild(this.createButton(t('createWorld.customize.flat.removeLayer'), () => {
+            if (this.draftWorld.flatLayers.length > 1 && selectedIdx >= 0) {
+                this.draftWorld.flatLayers.splice(selectedIdx, 1);
+                selectedIdx = Math.max(0, this.draftWorld.flatLayers.length - 1);
+                renderLayers();
+            }
+        }, 120));
+        body.appendChild(editRow);
+
+        footer.appendChild(this.createButton(t('createWorld.customize.presets'), () => {
+            this.openScreen('preset_flat_world');
+        }, 140));
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 140));
+    }
+
+            buildPresetFlatWorldScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('createWorld.customize.presets.title'),
+            'net/minecraft/client/gui/screens/PresetFlatWorldScreen'
+        );
+
+        const presets = this.pal.bytecodeBundle?.flatWorldPresets || {};
+        const presetKeys = Object.keys(presets);
+        let selectedKey = presetKeys[0] || 'minecraft:classic_flat';
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+
+        const renderPresets = () => {
+            listBox.innerHTML = '';
+            for (const pk of presetKeys) {
+                const p = presets[pk];
+                const shortName = pk.replace('minecraft:', '');
+                const label = t(`flat_world_preset.minecraft.${shortName}`);
+                const layersDesc = p.settings.layers.map((l                 ) => `${l.height}x ${l.block.replace('minecraft:', '')}`).join(', ');
+                const row = document.createElement('div');
+                row.className = `mc-list-row ${pk === selectedKey ? 'selected' : ''}`;
+                row.innerHTML = `
+                    <div><b>${label}</b> <span style="color:#aaa;font-size:11px;">(${p.settings.biome})</span></div>
+                    <div style="color:#bbb;font-size:11px;">${layersDesc}</div>
+                `;
+                row.addEventListener('click', () => {
+                    selectedKey = pk;
+                    this.playClick();
+                    renderPresets();
+                });
+                listBox.appendChild(row);
+            }
+        };
+        renderPresets();
+        body.appendChild(listBox);
+
+        footer.appendChild(this.createButton(t('createWorld.customize.presets.share'), () => {
+            const chosen = presets[selectedKey];
+            if (chosen) {
+                this.draftWorld.flatLayers = chosen.settings.layers.map(l => ({ ...l }));
+                this.draftWorld.flatBiome = chosen.settings.biome;
+            }
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3B. SINGLE BIOME SELECTOR (`CreateBuffetWorldScreen`)
+    // =========================================================================
+
+            buildCreateBuffetWorldScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('createWorld.customize.buffet.title'),
+            'net/minecraft/client/gui/screens/CreateBuffetWorldScreen'
+        );
+
+        const biomes = this.callbacks.getAllBiomes();
+        let chosenBiome = this.draftWorld.singleBiome;
+
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.className = 'mc-text-field';
+        searchInput.style.width = '300px';
+        searchInput.style.marginBottom = '6px';
+        searchInput.placeholder = 'Search 67 Biomes...';
+        body.appendChild(searchInput);
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        body.appendChild(listBox);
+
+        const renderBiomes = (q        ) => {
+            listBox.innerHTML = '';
+            const cleanQ = q.trim().toLowerCase();
+            for (const b of biomes) {
+                const label = t(`biome.minecraft.${b.name}`);
+                if (cleanQ && !b.name.includes(cleanQ) && !label.toLowerCase().includes(cleanQ)) continue;
+                const row = document.createElement('div');
+                row.className = `mc-list-row ${b.id === chosenBiome ? 'selected' : ''}`;
+                row.innerHTML = `<span><b>${label}</b></span><span style="color:#aaa;">${b.id} (T: ${b.temperature})</span>`;
+                row.addEventListener('click', () => {
+                    chosenBiome = b.id;
+                    this.playClick();
+                    renderBiomes(searchInput.value);
+                });
+                listBox.appendChild(row);
+            }
+        };
+        searchInput.addEventListener('input', () => renderBiomes(searchInput.value));
+        renderBiomes('');
+
+        footer.appendChild(this.createButton(t('gui.done'), () => {
+            this.draftWorld.singleBiome = chosenBiome;
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3C. GAME RULES CONFIGURATOR (`WorldCreationGameRulesScreen` - 59 Rules)
+    // =========================================================================
+
+            buildGameRulesScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('editGamerule.title'),
+            'net/minecraft/client/gui/screens/worldselection/WorldCreationGameRulesScreen'
+        );
+
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.className = 'mc-text-field';
+        searchInput.style.width = '320px';
+        searchInput.style.marginBottom = '6px';
+        searchInput.placeholder = 'Search 59 Game Rules...';
+        body.appendChild(searchInput);
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        body.appendChild(listBox);
+
+        const rules = this.pal.bytecodeBundle?.gameRules || [];
+        const renderRules = (q        ) => {
+            listBox.innerHTML = '';
+            const cleanQ = q.trim().toLowerCase();
+            let lastCat = '';
+            const sorted = [...rules].sort((a, b) => a.category.localeCompare(b.category) || a.id.localeCompare(b.id));
+            for (const r of sorted) {
+                const label = t(r.translationKey) !== r.translationKey ? t(r.translationKey) : r.label;
+                if (cleanQ && !r.id.includes(cleanQ) && !label.toLowerCase().includes(cleanQ)) continue;
+                if (r.category !== lastCat) {
+                    lastCat = r.category;
+                    const catHdr = document.createElement('div');
+                    catHdr.className = 'mc-list-category';
+                    catHdr.textContent = t(r.category) !== r.category ? t(r.category) : r.categoryLabel;
+                    listBox.appendChild(catHdr);
+                }
+
+                const row = document.createElement('div');
+                row.className = 'mc-list-row';
+                const left = document.createElement('div');
+                left.innerHTML = `<div><b>${label}</b></div><div style="font-size:11px;color:#999;">${r.id}</div>`;
+                row.appendChild(left);
+
+                const curVal = this.draftWorld.gameRules[r.id] ?? r.defaultValue;
+                if (r.type === 'boolean') {
+                    const btn = this.createButton(curVal ? t('options.on') : t('options.off'), () => {
+                        this.draftWorld.gameRules[r.id] = !this.draftWorld.gameRules[r.id];
+                        renderRules(searchInput.value);
+                    }, 80);
+                    row.appendChild(btn);
+                } else {
+                    const numIn = document.createElement('input');
+                    numIn.type = 'number';
+                    numIn.className = 'mc-text-field';
+                    numIn.style.width = '76px';
+                    numIn.value = String(curVal);
+                    numIn.addEventListener('input', () => {
+                        this.draftWorld.gameRules[r.id] = parseInt(numIn.value, 10) || 0;
+                    });
+                    row.appendChild(numIn);
+                }
+                listBox.appendChild(row);
+            }
+        };
+        searchInput.addEventListener('input', () => renderRules(searchInput.value));
+        renderRules('');
+
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3D. EXPERIMENTS SCREEN (`ExperimentsScreen`)
+    // =========================================================================
+
+            buildExperimentsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('selectWorld.experiments'),
+            'net/minecraft/client/gui/screens/worldselection/ExperimentsScreen'
+        );
+
+        const exps = [
+            { id: 'sulfur_caves_26_3', title: 'Minecraft 26.3 Sulfur Caves & Dappled Forest', desc: 'Enables Sulfur, Potent Sulfur, Sulfur Spikes, Sulfur Cubes, and Dappled Forest biomes.' },
+            { id: 'bundle', title: 'Bundles', desc: 'Enables crafting and using Bundle storage items.' },
+            { id: 'trade_rebalance', title: 'Villager Trade Rebalance', desc: 'Updated librarian and cartographer biome-specific trades.' },
+            { id: 'redstone_experiments', title: 'Redstone Wire Experimental Updates', desc: 'Deterministic left-first redstone dust update order.' },
+            { id: 'minecart_improvements', title: 'Minecart Improvements', desc: 'Configurable max_minecart_speed and physics.' },
+        ];
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        const renderExps = () => {
+            listBox.innerHTML = '';
+            for (const ex of exps) {
+                const enabled = this.draftWorld.experiments.includes(ex.id);
+                const row = document.createElement('div');
+                row.className = 'mc-list-row';
+                row.innerHTML = `<div><b>${ex.title}</b><div style="font-size:11px;color:#aaa;">${ex.desc}</div></div>`;
+                row.appendChild(this.createButton(enabled ? t('options.on') : t('options.off'), () => {
+                    if (enabled) {
+                        this.draftWorld.experiments = this.draftWorld.experiments.filter(x => x !== ex.id);
+                    } else {
+                        this.draftWorld.experiments.push(ex.id);
+                    }
+                    renderExps();
+                }, 80));
+                listBox.appendChild(row);
+            }
+        };
+        renderExps();
+        body.appendChild(listBox);
+
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 3E. LEVEL LOADING SCREEN (`LevelLoadingScreen` with Chunk Status Square)
+    // =========================================================================
+
+            async launchWorldWithLoadingScreen(worldConfig                   )                {
+        worldConfig.lastPlayedMs = Date.now();
+        await this.pal.persistSavedWorlds();
+
+        this.levelLoadProgress = 0;
+        this.levelLoadStage = `${this.pal.translate('createWorld.preparing')} (0%)`;
+        this.openScreen('level_loading', false);
+
+        for (const pct of [18, 42, 68, 88, 100]) {
+            await new Promise(r => setTimeout(r, 75));
+            this.levelLoadProgress = pct;
+            this.levelLoadStage = `${this.pal.translate('multiplayer.downloadingTerrain')} (${pct}%)`;
+            if (this.activeScreen === 'level_loading') this.renderCurrentScreenDom();
+        }
+
+        await this.callbacks.onStartWorld(worldConfig);
+        this.inWorld = true;
+        this.openScreen('none', false);
+    }
+
+            buildLevelLoadingScreen(t                                                        )       {
+        const { body } = this.createScreenFrame(
+            t('multiplayer.downloadingTerrain'),
+            'net/minecraft/client/gui/screens/LevelLoadingScreen'
+        );
+
+        const box = document.createElement('div');
+        box.style.display = 'flex';
+        box.style.flexDirection = 'column';
+        box.style.alignItems = 'center';
+        box.style.gap = '14px';
+
+        // Authentic 11x11 Chunk Status Grid visualization
+        const grid = document.createElement('div');
+        grid.style.display = 'grid';
+        grid.style.gridTemplateColumns = 'repeat(11, 10px)';
+        grid.style.gap = '1px';
+        grid.style.background = '#111111';
+        grid.style.padding = '4px';
+        grid.style.border = '2px solid #555555';
+
+        const radiusFilled = Math.floor((this.levelLoadProgress / 100) * 6);
+        for (let z = -5; z <= 5; z++) {
+            for (let x = -5; x <= 5; x++) {
+                const dist = Math.max(Math.abs(x), Math.abs(z));
+                const cell = document.createElement('div');
+                cell.style.width = '10px';
+                cell.style.height = '10px';
+                cell.style.background = dist < radiusFilled ? '#ffffff'
+                    : dist === radiusFilled ? '#80ff20'
+                    : dist === radiusFilled + 1 ? '#666666'
+                    : '#222222';
+                grid.appendChild(cell);
+            }
+        }
+
+        const pctLbl = document.createElement('div');
+        pctLbl.style.fontSize = '18px';
+        pctLbl.textContent = `${this.levelLoadProgress}%`;
+
+        const stageLbl = document.createElement('div');
+        stageLbl.style.color = '#cccccc';
+        stageLbl.textContent = this.levelLoadStage;
+
+        box.appendChild(grid);
+        box.appendChild(pctLbl);
+        box.appendChild(stageLbl);
+        body.appendChild(box);
+    }
+
+    // =========================================================================
+    // 4. OPTIONS SCREEN HIERARCHY (`OptionsScreen` & all Sub-Screens)
+    // =========================================================================
+
+            buildOptionsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.title'),
+            'net/minecraft/client/gui/screens/options/OptionsScreen'
+        );
+        const opt = this.pal.options;
+
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        // Top row: FOV slider + Difficulty / Online Options
+        grid.appendChild(this.createSlider(
+            (v) => {
+                const val = Math.round(v);
+                const suffix = val === 70 ? t('options.fov.min') : val === 110 ? t('options.fov.max') : String(val);
+                return `${t('options.fov')}: ${suffix}`;
+            },
+            30, 110, 1, opt.fov,
+            (v) => {
+                opt.fov = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.difficulty')}: ${t('options.difficulty.' + this.draftWorld.difficulty)}`,
+            () => {
+                const diffs                                                 = ['peaceful', 'easy', 'normal', 'hard'];
+                this.draftWorld.difficulty = diffs[(diffs.indexOf(this.draftWorld.difficulty) + 1) % diffs.length];
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 10 Vanilla Sub-Screen Buttons
+        grid.appendChild(this.createButton(t('options.skinCustomisation'), () => this.openScreen('skin_customization'), 150));
+        grid.appendChild(this.createButton(t('options.sounds'), () => this.openScreen('sound_options'), 150));
+
+        grid.appendChild(this.createButton(t('options.video'), () => this.openScreen('video_settings'), 150));
+        grid.appendChild(this.createButton(t('options.controls'), () => this.openScreen('controls'), 150));
+
+        grid.appendChild(this.createButton(t('options.language'), () => this.openScreen('language_select'), 150));
+        grid.appendChild(this.createButton(t('options.chat'), () => this.openScreen('chat_options'), 150));
+
+        grid.appendChild(this.createButton(t('options.resourcepack'), () => this.openScreen('pack_selection'), 150));
+        grid.appendChild(this.createButton(t('options.accessibility'), () => this.openScreen('accessibility_options'), 150));
+
+        grid.appendChild(this.createButton(t('options.credits_and_attribution'), () => this.openScreen('credits'), 150));
+        if (this.inWorld) {
+            grid.appendChild(this.createButton(t('selectWorld.gameRules'), () => this.openScreen('world_game_rules'), 150));
+        } else {
+            grid.appendChild(this.createButton(t('options.online'), () => this.openScreen('multiplayer'), 150));
+        }
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => {
+            this.pal.saveOptions();
+            this.navigateBack();
+        }, 200));
+    }
+
+    // =========================================================================
+    // 4.1 VIDEO SETTINGS SCREEN (`VideoSettingsScreen`)
+    // =========================================================================
+
+            buildVideoSettingsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.videoTitle'),
+            'net/minecraft/client/gui/screens/options/VideoSettingsScreen'
+        );
+        const opt = this.pal.options;
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        // 1. Render Distance (2 to 32 chunks)
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.renderDistance')}: ${Math.round(v)} chunks`,
+            2, 32, 1, opt.renderDistance,
+            (v) => {
+                opt.renderDistance = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 2. Simulation Distance (5 to 32 chunks)
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.simulationDistance')}: ${Math.round(v)} chunks`,
+            5, 32, 1, opt.simulationDistance,
+            (v) => {
+                opt.simulationDistance = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 3. Graphics Mode (Fast / Fancy / Fabulous!)
+        const gModes                                       = ['fast', 'fancy', 'fabulous'];
+        grid.appendChild(this.createButton(
+            `Graphics: ${opt.graphicsMode === 'fabulous' ? 'Fabulous!' : opt.graphicsMode === 'fancy' ? 'Fancy' : 'Fast'}`,
+            () => {
+                opt.graphicsMode = gModes[(gModes.indexOf(opt.graphicsMode) + 1) % gModes.length];
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 4. Graphics Backend (WebGPU / WebGL2)
+        grid.appendChild(this.createButton(
+            `Backend: ${opt.preferredGraphicsBackend}`,
+            async () => {
+                opt.preferredGraphicsBackend = opt.preferredGraphicsBackend === 'WebGPU' ? 'WebGL2' : 'WebGPU';
+                await this.pal.saveOptions();
+                await this.callbacks.onVideoOptionsChanged(true);
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 5. Smooth Lighting (Off / Minimum / Maximum)
+        const aoModes                                       = ['off', 'minimum', 'maximum'];
+        grid.appendChild(this.createButton(
+            `${t('options.ao')}: ${opt.smoothLighting === 'off' ? t('options.off') : opt.smoothLighting === 'minimum' ? 'Minimum' : 'Maximum'}`,
+            () => {
+                opt.smoothLighting = aoModes[(aoModes.indexOf(opt.smoothLighting) + 1) % aoModes.length];
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 6. GUI Scale (Auto, 1, 2, 3, 4)
+        grid.appendChild(this.createButton(
+            `${t('options.guiScale')}: ${opt.guiScale === 0 ? t('options.guiScale.auto') : opt.guiScale}`,
+            () => {
+                opt.guiScale = (opt.guiScale + 1) % 5;
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 7. Max Framerate (10 FPS to 260 = Unlimited)
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.framerateLimit')}: ${v >= 260 ? t('options.framerateLimit.max') : `${Math.round(v)} fps`}`,
+            10, 260, 10, opt.maxFps,
+            (v) => {
+                opt.maxFps = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 8. VSync (On / Off)
+        grid.appendChild(this.createButton(
+            `${t('options.vsync')}: ${opt.enableVsync ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.enableVsync = !opt.enableVsync;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 9. Brightness / Gamma (Moody 0% to Bright 100%)
+        grid.appendChild(this.createSlider(
+            (v) => {
+                const pct = Math.round(v * 100);
+                const tag = pct === 0 ? t('options.gamma.min') : pct === 50 ? t('options.gamma.default') : pct === 100 ? t('options.gamma.max') : `+${pct}%`;
+                return `${t('options.gamma')}: ${tag}`;
+            },
+            0, 1, 0.01, opt.gamma,
+            (v) => {
+                opt.gamma = v;
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 10. Clouds (Off / Fast / Fancy)
+        const cModes                                  = ['off', 'fast', 'fancy'];
+        grid.appendChild(this.createButton(
+            `${t('options.renderClouds')}: ${opt.renderClouds === 'off' ? t('options.off') : opt.renderClouds === 'fast' ? 'Fast' : 'Fancy'}`,
+            () => {
+                opt.renderClouds = cModes[(cModes.indexOf(opt.renderClouds) + 1) % cModes.length];
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 11. Cloud Height (-64 to 320)
+        grid.appendChild(this.createSlider(
+            (v) => `Cloud Height: ${Math.round(v)}`,
+            64, 256, 4, opt.cloudRange,
+            (v) => {
+                opt.cloudRange = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 12. Particles (All / Decreased / Minimal)
+        const pModes                                         = ['all', 'decreased', 'minimal'];
+        grid.appendChild(this.createButton(
+            `${t('options.particles')}: ${t('options.particles.' + opt.particles)}`,
+            () => {
+                opt.particles = pModes[(pModes.indexOf(opt.particles) + 1) % pModes.length];
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 13. Mipmap Levels (Off, 1, 2, 3, 4)
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.mipmapLevels')}: ${Math.round(v) === 0 ? t('options.off') : Math.round(v)}`,
+            0, 4, 1, opt.mipmapLevels,
+            (v) => {
+                opt.mipmapLevels = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 14. Biome Blend (Off to 15x15)
+        const blendLabels = ['Off', '3x3', '5x5', '7x7', '9x9', '11x11', '13x13', '15x15'];
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.biomeBlendRadius')}: ${blendLabels[Math.round(v)] || '5x5'}`,
+            0, 7, 1, opt.biomeBlendRadius,
+            (v) => {
+                opt.biomeBlendRadius = Math.round(v);
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 15. Entity Distance (50% to 500%)
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.entityDistanceScaling')}: ${Math.round(v * 100)}%`,
+            0.5, 5.0, 0.25, opt.entityDistanceScaling,
+            (v) => {
+                opt.entityDistanceScaling = v;
+                this.callbacks.onVideoOptionsChanged();
+            },
+            150
+        ));
+
+        // 16. Entity Shadows (On / Off)
+        grid.appendChild(this.createButton(
+            `${t('options.entityShadows')}: ${opt.entityShadows ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.entityShadows = !opt.entityShadows;
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        // 17. Distortion Effects & 18. FOV Effects sliders
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.screenEffectScale')}: ${v === 0 ? t('options.off') : `${Math.round(v * 100)}%`}`,
+            0, 1, 0.05, opt.screenEffectScale,
+            (v) => { opt.screenEffectScale = v; },
+            150
+        ));
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.fovEffectScale')}: ${v === 0 ? t('options.off') : `${Math.round(v * 100)}%`}`,
+            0, 1, 0.05, opt.fovEffectScale,
+            (v) => { opt.fovEffectScale = v; },
+            150
+        ));
+
+        // 19. View Bobbing, 20. Attack Indicator, 21. Autosave Indicator, 22. Fullscreen
+        grid.appendChild(this.createButton(
+            `${t('options.viewBobbing')}: ${opt.bobView ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.bobView = !opt.bobView;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        const atkModes                                        = ['crosshair', 'hotbar', 'off'];
+        grid.appendChild(this.createButton(
+            `${t('options.attackIndicator')}: ${t('options.attack.' + opt.attackIndicator)}`,
+            () => {
+                opt.attackIndicator = atkModes[(atkModes.indexOf(opt.attackIndicator) + 1) % atkModes.length];
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.autosaveIndicator')}: ${opt.showAutosaveIndicator ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.showAutosaveIndicator = !opt.showAutosaveIndicator;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.fullscreen')}: ${opt.fullscreen ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.fullscreen = !opt.fullscreen;
+                if (opt.fullscreen) document.documentElement.requestFullscreen?.().catch(() => {});
+                else document.exitFullscreen?.().catch(() => {});
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        listBox.appendChild(grid);
+        body.appendChild(listBox);
+
+        footer.appendChild(this.createButton(t('gui.done'), () => {
+            this.pal.saveOptions();
+            this.navigateBack();
+        }, 200));
+    }
+
+    // =========================================================================
+    // 4.2 SOUND OPTIONS SCREEN (`SoundOptionsScreen`)
+    // =========================================================================
+
+            buildSoundOptionsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.sounds.title'),
+            'net/minecraft/client/gui/screens/options/SoundOptionsScreen'
+        );
+        const opt = this.pal.options;
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+
+        // Master Volume full-width slider at top
+        const masterRow = document.createElement('div');
+        masterRow.style.display = 'flex';
+        masterRow.style.justifyContent = 'center';
+        masterRow.style.marginBottom = '8px';
+        masterRow.appendChild(this.createSlider(
+            (v) => `${t('soundCategory.master')}: ${Math.round(v * 100) === 0 ? t('options.off') : `${Math.round(v * 100)}%`}`,
+            0, 1, 0.01, opt.soundVolumes[SoundSource.MASTER],
+            (v) => {
+                opt.soundVolumes[SoundSource.MASTER] = v;
+                this.pal.syncAudioOptions();
+            },
+            310
+        ));
+        listBox.appendChild(masterRow);
+
+        // All 9 individual SoundCategory sliders
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+        const categories                                           = [
+            { src: SoundSource.MUSIC, key: 'soundCategory.music' },
+            { src: SoundSource.RECORDS, key: 'soundCategory.record' },
+            { src: SoundSource.WEATHER, key: 'soundCategory.weather' },
+            { src: SoundSource.BLOCKS, key: 'soundCategory.block' },
+            { src: SoundSource.HOSTILE, key: 'soundCategory.hostile' },
+            { src: SoundSource.NEUTRAL, key: 'soundCategory.neutral' },
+            { src: SoundSource.PLAYERS, key: 'soundCategory.player' },
+            { src: SoundSource.AMBIENT, key: 'soundCategory.ambient' },
+            { src: SoundSource.VOICE, key: 'soundCategory.voice' },
+        ];
+        for (const cat of categories) {
+            grid.appendChild(this.createSlider(
+                (v) => `${t(cat.key)}: ${Math.round(v * 100) === 0 ? t('options.off') : `${Math.round(v * 100)}%`}`,
+                0, 1, 0.01, opt.soundVolumes[cat.src],
+                (v) => {
+                    opt.soundVolumes[cat.src] = v;
+                    this.pal.syncAudioOptions();
+                },
+                150
+            ));
+        }
+
+        // Device, Show Subtitles, Directional Audio (HRTF)
+        grid.appendChild(this.createButton(
+            `${t('options.audioDevice')}: WebAudio OpenAL HRTF`,
+            () => {},
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.showSubtitles')}: ${opt.showSubtitles ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.showSubtitles = !opt.showSubtitles;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.directionalAudio')}: ${opt.directionalAudio ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.directionalAudio = !opt.directionalAudio;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        listBox.appendChild(grid);
+        body.appendChild(listBox);
+
+        footer.appendChild(this.createButton(t('gui.done'), () => {
+            this.pal.saveOptions();
+            this.navigateBack();
+        }, 200));
+    }
+
+    // =========================================================================
+    // 4.3 CONTROLS, MOUSE SETTINGS & KEY BINDS (`ControlsScreen`, `MouseSettingsScreen`, `KeyBindsScreen`)
+    // =========================================================================
+
+            buildControlsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('controls.title'),
+            'net/minecraft/client/gui/screens/options/controls/ControlsScreen'
+        );
+        const opt = this.pal.options;
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        grid.appendChild(this.createButton(t('options.mouse_settings'), () => this.openScreen('mouse_settings'), 150));
+        grid.appendChild(this.createButton(t('controls.keybinds'), () => this.openScreen('keybinds'), 150));
+
+        grid.appendChild(this.createButton(
+            `${t('key.sneak')}: ${opt.toggleCrouch ? t('options.key.toggle') : t('options.key.hold')}`,
+            () => {
+                opt.toggleCrouch = !opt.toggleCrouch;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('key.sprint')}: ${opt.toggleSprint ? t('options.key.toggle') : t('options.key.hold')}`,
+            () => {
+                opt.toggleSprint = !opt.toggleSprint;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.autoJump')}: ${opt.autoJump ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.autoJump = !opt.autoJump;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('options.operatorItemsTab')}: ${opt.operatorItemsTab ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.operatorItemsTab = !opt.operatorItemsTab;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+            buildMouseSettingsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.mouse_settings.title'),
+            'net/minecraft/client/gui/screens/options/MouseSettingsScreen'
+        );
+        const opt = this.pal.options;
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        grid.appendChild(this.createSlider(
+            (v) => {
+                const pct = Math.round(v * 200);
+                const valStr = pct === 0 ? t('options.sensitivity.min') : pct === 200 ? t('options.sensitivity.max') : `${pct}%`;
+                return `${t('options.sensitivity')}: ${valStr}`;
+            },
+            0, 1, 0.01, opt.mouseSensitivity,
+            (v) => { opt.mouseSensitivity = v; },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.invertMouse')}: ${opt.invertYMouse ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.invertYMouse = !opt.invertYMouse;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.mouseWheelSensitivity')}: ${Math.round(v * 100)}%`,
+            0.1, 2.0, 0.05, opt.mouseWheelSensitivity,
+            (v) => { opt.mouseWheelSensitivity = v; },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.discrete_mouse_scroll')}: ${opt.discreteMouseScroll ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.discreteMouseScroll = !opt.discreteMouseScroll;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        grid.appendChild(this.createButton(
+            `${t('options.touchscreen')}: ${opt.touchscreen ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.touchscreen = !opt.touchscreen;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => {
+            this.pal.saveOptions();
+            this.navigateBack();
+        }, 200));
+    }
+
+            buildKeyBindsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('controls.keybinds.title'),
+            'net/minecraft/client/gui/screens/options/controls/KeyBindsScreen'
+        );
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        let lastCat = '';
+
+        for (const kb of this.pal.options.keyBinds) {
+            if (kb.category !== lastCat) {
+                lastCat = kb.category;
+                const hdr = document.createElement('div');
+                hdr.className = 'mc-list-category';
+                hdr.textContent = t(kb.category);
+                listBox.appendChild(hdr);
+            }
+            const row = document.createElement('div');
+            row.className = 'mc-list-row';
+            const lbl = document.createElement('span');
+            lbl.textContent = t(kb.id);
+            row.appendChild(lbl);
+
+            const right = document.createElement('div');
+            right.className = 'mc-btn-row';
+            const isListening = this.keybindListeningId === kb.id;
+            const keyBtn = this.createButton(
+                isListening ? `> ${kb.boundCode} <` : kb.boundCode,
+                () => {
+                    this.keybindListeningId = kb.id;
+                    this.renderCurrentScreenDom();
+                },
+                90
+            );
+            if (isListening) keyBtn.style.color = '#ffff55';
+
+            const resetBtn = this.createButton(
+                t('controls.reset'),
+                () => {
+                    kb.boundCode = kb.defaultCode;
+                    this.pal.saveOptions();
+                    this.renderCurrentScreenDom();
+                },
+                55,
+                kb.boundCode === kb.defaultCode
+            );
+
+            right.appendChild(keyBtn);
+            right.appendChild(resetBtn);
+            row.appendChild(right);
+            listBox.appendChild(row);
+        }
+
+        body.appendChild(listBox);
+
+        footer.appendChild(this.createButton(t('controls.resetAll'), () => {
+            for (const kb of this.pal.options.keyBinds) kb.boundCode = kb.defaultCode;
+            this.pal.saveOptions();
+            this.renderCurrentScreenDom();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 4.4 LANGUAGE SELECTION SCREEN (`LanguageSelectScreen` - All 143 Languages)
+    // =========================================================================
+
+            buildLanguageSelectScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.language.title'),
+            'net/minecraft/client/gui/screens/options/LanguageSelectScreen'
+        );
+
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.className = 'mc-text-field';
+        searchInput.style.width = '300px';
+        searchInput.style.marginBottom = '6px';
+        searchInput.placeholder = t('gui.language.search');
+        body.appendChild(searchInput);
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        body.appendChild(listBox);
+
+        const langs = this.pal.bytecodeBundle?.languages || { en_us: { name: 'English', region: 'US', bidirectional: false } };
+        let pendingLang = this.pal.options.lang;
+
+        const renderLangs = (q        ) => {
+            listBox.innerHTML = '';
+            const cleanQ = q.trim().toLowerCase();
+            for (const [code, meta] of Object.entries(langs)) {
+                const label = `${meta.name} (${meta.region})`;
+                if (cleanQ && !code.toLowerCase().includes(cleanQ) && !label.toLowerCase().includes(cleanQ)) continue;
+                const row = document.createElement('div');
+                row.className = `mc-list-row ${code.toLowerCase() === pendingLang ? 'selected' : ''}`;
+                row.style.justifyContent = 'center';
+                row.textContent = label;
+                row.addEventListener('click', () => {
+                    pendingLang = code.toLowerCase();
+                    this.playClick();
+                    renderLangs(searchInput.value);
+                });
+                listBox.appendChild(row);
+            }
+        };
+        searchInput.addEventListener('input', () => renderLangs(searchInput.value));
+        renderLangs('');
+
+        const warn = document.createElement('div');
+        warn.style.fontSize = '11px';
+        warn.style.color = '#aaaaaa';
+        warn.style.marginTop = '4px';
+        warn.textContent = t('options.languageAccuracyWarning');
+        body.appendChild(warn);
+
+        footer.appendChild(this.createButton(
+            `${t('options.forceUnicodeFont')}: ${this.pal.options.forceUnicodeFont ? t('options.on') : t('options.off')}`,
+            () => {
+                this.pal.options.forceUnicodeFont = !this.pal.options.forceUnicodeFont;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        footer.appendChild(this.createButton(t('gui.done'), async () => {
+            if (pendingLang !== this.pal.options.lang) {
+                await this.pal.loadLanguage(pendingLang);
+                await this.pal.saveOptions();
+                this.triggerResourceReloadSplash(`Reloading Language: ${pendingLang}...`, () => {
+                    this.navigateBack();
+                });
+            } else {
+                this.navigateBack();
+            }
+        }, 150));
+    }
+
+    // =========================================================================
+    // 4.5 RESOURCE PACKS SCREEN (`PackSelectionScreen` with Dual Lists & .ZIP Drop)
+    // =========================================================================
+
+            buildPackSelectionScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('resourcePack.title'),
+            'net/minecraft/client/gui/screens/packs/PackSelectionScreen'
+        );
+        const opt = this.pal.options;
+
+        const dropHint = document.createElement('div');
+        dropHint.style.fontSize = '12px';
+        dropHint.style.color = '#bbbbbb';
+        dropHint.style.marginBottom = '6px';
+        dropHint.textContent = t('pack.dropInfo');
+        body.appendChild(dropHint);
+
+        const dualWrap = document.createElement('div');
+        dualWrap.className = 'mc-dual-lists';
+
+        const leftCol = document.createElement('div');
+        leftCol.className = 'mc-pack-col';
+        const rightCol = document.createElement('div');
+        rightCol.className = 'mc-pack-col';
+
+        const renderColumns = () => {
+            leftCol.innerHTML = `<div class="mc-list-category">${t('pack.available.title')}</div>`;
+            rightCol.innerHTML = `<div class="mc-list-category">${t('pack.selected.title')}</div>`;
+
+            for (const pack of this.pal.availableResourcePacks) {
+                const isSelected = opt.selectedResourcePacks.includes(pack.id);
+                const row = document.createElement('div');
+                row.className = 'mc-list-row';
+                row.innerHTML = `
+                    <div>
+                        <div><b>${pack.title}</b></div>
+                        <div style="font-size:11px;color:#aaa;">${pack.description}</div>
+                    </div>
+                `;
+                if (!isSelected) {
+                    row.appendChild(this.createButton('>>', () => {
+                        opt.selectedResourcePacks.push(pack.id);
+                        if (pack.highContrast) opt.highContrast = true;
+                        renderColumns();
+                    }, 42));
+                    leftCol.appendChild(row);
+                } else {
+                    row.appendChild(this.createButton('<<', () => {
+                        if (pack.id === 'vanilla') return;
+                        opt.selectedResourcePacks = opt.selectedResourcePacks.filter(id => id !== pack.id);
+                        if (pack.highContrast) opt.highContrast = false;
+                        renderColumns();
+                    }, 42, pack.id === 'vanilla'));
+                    rightCol.appendChild(row);
+                }
+            }
+        };
+        renderColumns();
+
+        dualWrap.appendChild(leftCol);
+        dualWrap.appendChild(rightCol);
+        body.appendChild(dualWrap);
+
+        // Hidden file input triggered by "Open Pack Folder" so users can either drag-drop or click to upload .zip packs
+        const fileIn = document.createElement('input');
+        fileIn.type = 'file';
+        fileIn.accept = '.zip';
+        fileIn.multiple = true;
+        fileIn.style.display = 'none';
+        fileIn.addEventListener('change', async () => {
+            if (!fileIn.files) return;
+            for (let i = 0; i < fileIn.files.length; i++) {
+                await this.pal.importZipResourcePack(fileIn.files[i]);
+            }
+            renderColumns();
+        });
+        body.appendChild(fileIn);
+
+        footer.appendChild(this.createButton(t('pack.openFolder'), () => fileIn.click(), 150));
+        footer.appendChild(this.createButton(t('gui.done'), async () => {
+            await this.pal.saveOptions();
+            this.triggerResourceReloadSplash('Reloading ResourceManager & Texture Atlases...', () => {
+                this.navigateBack();
+            });
+        }, 150));
+    }
+
+    // =========================================================================
+    // 4.6 SKIN CUSTOMIZATION SCREEN (`SkinCustomizationScreen`)
+    // =========================================================================
+
+            buildSkinCustomizationScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.skinCustomisation.title'),
+            'net/minecraft/client/gui/screens/options/SkinCustomizationScreen'
+        );
+        const opt = this.pal.options;
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        const parts                                                 = [
+            { key: 'options.modelPart.cape', prop: 'modelPartCape' },
+            { key: 'options.modelPart.jacket', prop: 'modelPartJacket' },
+            { key: 'options.modelPart.left_sleeve', prop: 'modelPartLeftSleeve' },
+            { key: 'options.modelPart.right_sleeve', prop: 'modelPartRightSleeve' },
+            { key: 'options.modelPart.left_pants_leg', prop: 'modelPartLeftPantsLeg' },
+            { key: 'options.modelPart.right_pants_leg', prop: 'modelPartRightPantsLeg' },
+            { key: 'options.modelPart.hat', prop: 'modelPartHat' },
+        ];
+        for (const p of parts) {
+            const val = Boolean(opt[p.prop]);
+            grid.appendChild(this.createButton(
+                `${t(p.key)}: ${val ? t('options.on') : t('options.off')}`,
+                () => {
+                    (opt[p.prop]           ) = !val;
+                    this.pal.saveOptions();
+                    this.renderCurrentScreenDom();
+                },
+                150
+            ));
+        }
+
+        grid.appendChild(this.createButton(
+            `${t('options.mainHand')}: ${opt.mainHand === 'left' ? t('options.mainHand.left') : t('options.mainHand.right')}`,
+            () => {
+                opt.mainHand = opt.mainHand === 'right' ? 'left' : 'right';
+                this.pal.saveOptions();
+                this.callbacks.onVideoOptionsChanged();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+    // =========================================================================
+    // 4.7 CHAT & ACCESSIBILITY OPTIONS (`ChatOptionsScreen` & `AccessibilityOptionsScreen`)
+    // =========================================================================
+
+            buildChatOptionsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.chat.title'),
+            'net/minecraft/client/gui/screens/options/ChatOptionsScreen'
+        );
+        const opt = this.pal.options;
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        const visModes                                      = ['full', 'system', 'hidden'];
+        grid.appendChild(this.createButton(
+            `${t('options.chat.visibility')}: ${opt.chatVisibility}`,
+            () => {
+                opt.chatVisibility = visModes[(visModes.indexOf(opt.chatVisibility) + 1) % visModes.length];
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('options.chat.color')}: ${opt.chatColors ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.chatColors = !opt.chatColors;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.chat.opacity')}: ${Math.round(v * 100)}%`,
+            0.1, 1.0, 0.05, opt.chatOpacity,
+            (v) => { opt.chatOpacity = v; },
+            150
+        ));
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.chat.scale')}: ${Math.round(v * 100)}%`,
+            0.0, 1.0, 0.05, opt.chatScale,
+            (v) => { opt.chatScale = v; },
+            150
+        ));
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+            buildAccessibilityOptionsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.accessibility.title'),
+            'net/minecraft/client/gui/screens/options/AccessibilityOptionsScreen'
+        );
+        const opt = this.pal.options;
+        const grid = document.createElement('div');
+        grid.className = 'mc-options-grid';
+
+        grid.appendChild(this.createButton(
+            `${t('options.accessibility.high_contrast')}: ${opt.highContrast ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.highContrast = !opt.highContrast;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('options.darkMojangStudiosBackgroundColor')}: ${opt.darkMojangStudiosBackground ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.darkMojangStudiosBackground = !opt.darkMojangStudiosBackground;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.accessibility.menu_background_blurriness')}: ${Math.round(v)}`,
+            0, 10, 1, opt.menuBackgroundBlurriness,
+            (v) => { opt.menuBackgroundBlurriness = Math.round(v); },
+            150
+        ));
+        grid.appendChild(this.createSlider(
+            (v) => `${t('options.accessibility.panorama_speed')}: ${Math.round(v * 100)}%`,
+            0, 1, 0.05, opt.panoramaScrollSpeed,
+            (v) => { opt.panoramaScrollSpeed = v; },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('options.hideSplashTexts')}: ${opt.hideSplashTexts ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.hideSplashTexts = !opt.hideSplashTexts;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+        grid.appendChild(this.createButton(
+            `${t('options.showSubtitles')}: ${opt.showSubtitles ? t('options.on') : t('options.off')}`,
+            () => {
+                opt.showSubtitles = !opt.showSubtitles;
+                this.pal.saveOptions();
+                this.renderCurrentScreenDom();
+            },
+            150
+        ));
+
+        body.appendChild(grid);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+    // =========================================================================
+    // 5. MULTIPLAYER, REALMS, CREDITS & QUIT CONFIRMATION
+    // =========================================================================
+
+            buildMultiplayerScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('multiplayer.title'),
+            'net/minecraft/client/gui/screens/multiplayer/JoinMultiplayerScreen'
+        );
+
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        listBox.style.height = '150px';
+
+        const renderServers = () => {
+            listBox.innerHTML = '';
+            this.servers.forEach((srv, idx) => {
+                const row = document.createElement('div');
+                row.className = `mc-list-row ${idx === this.selectedServerIdx ? 'selected' : ''}`;
+                row.innerHTML = `
+                    <div>
+                        <div><b>${srv.name}</b> <span style="color:#aaa;">(${srv.address})</span></div>
+                        <div style="font-size:11px;color:#7efc20;">${srv.motd}</div>
+                    </div>
+                    <div style="color:#80ff20;font-size:12px;">${srv.pingMs ? `${srv.pingMs}ms` : 'Protocol 777'}</div>
+                `;
+                row.addEventListener('click', () => {
+                    this.selectedServerIdx = idx;
+                    addrIn.value = srv.address;
+                    this.playClick();
+                    renderServers();
+                });
+                listBox.appendChild(row);
+            });
+        };
+
+        const controlsStack = document.createElement('div');
+        controlsStack.className = 'mc-form-stack';
+        controlsStack.style.marginTop = '6px';
+
+        const rowInputs = document.createElement('div');
+        rowInputs.className = 'mc-btn-row';
+
+        const wispIn = document.createElement('input');
+        wispIn.type = 'text';
+        wispIn.className = 'mc-text-field';
+        wispIn.style.width = '145px';
+        wispIn.value = this.wispServerUrl;
+        wispIn.title = 'Wisp Proxy WebSocket URL';
+        wispIn.addEventListener('input', () => { this.wispServerUrl = wispIn.value; });
+
+        const addrIn = document.createElement('input');
+        addrIn.type = 'text';
+        addrIn.className = 'mc-text-field';
+        addrIn.style.width = '165px';
+        addrIn.value = this.servers[this.selectedServerIdx]?.address || 'mc.hypixel.net:25565';
+
+        const userIn = document.createElement('input');
+        userIn.type = 'text';
+        userIn.className = 'mc-text-field';
+        userIn.style.width = '110px';
+        userIn.value = this.mpUsername;
+        userIn.addEventListener('input', () => { this.mpUsername = userIn.value; });
+
+        rowInputs.appendChild(wispIn);
+        rowInputs.appendChild(addrIn);
+        rowInputs.appendChild(userIn);
+        controlsStack.appendChild(rowInputs);
+
+        const statusLog = document.createElement('div');
+        statusLog.style.background = '#101014';
+        statusLog.style.border = '1px solid #555';
+        statusLog.style.color = '#7efc20';
+        statusLog.style.padding = '6px 8px';
+        statusLog.style.fontSize = '11px';
+        statusLog.style.width = '440px';
+        statusLog.style.minHeight = '36px';
+        statusLog.textContent = 'Ready. Uses epoxy.wasm + Wisp multiplexer (0x01 CONNECT / 0x02 DATA) + Protocol 777.';
+        controlsStack.appendChild(statusLog);
+
+        renderServers();
+        body.appendChild(listBox);
+        body.appendChild(controlsStack);
+
+        const setLog = (msg        ) => { statusLog.textContent = msg; };
+
+        const row1 = document.createElement('div');
+        row1.className = 'mc-btn-row';
+        row1.appendChild(this.createButton(t('selectServer.select'), () => {
+            this.callbacks.onConnectMultiplayer(wispIn.value.trim(), addrIn.value.trim(), userIn.value.trim(), setLog);
+        }, 105));
+        row1.appendChild(this.createButton(t('selectServer.refresh'), () => {
+            this.callbacks.onPingMultiplayer(wispIn.value.trim(), addrIn.value.trim(), setLog);
+        }, 105));
+        row1.appendChild(this.createButton(t('selectServer.add'), () => {
+            const addr = addrIn.value.trim();
+            if (addr) {
+                this.servers.push({ name: `Minecraft Server #${this.servers.length + 1}`, address: addr, motd: 'Custom Protocol 777 Server' });
+                renderServers();
+            }
+        }, 105));
+        row1.appendChild(this.createButton('Microsoft Auth', () => {
+            this.callbacks.onMsaLogin(wispIn.value.trim(), setLog, (name) => {
+                this.mpUsername = name;
+                userIn.value = name;
+            });
+        }, 115));
+
+        const row2 = document.createElement('div');
+        row2.className = 'mc-btn-row';
+        row2.appendChild(this.createButton(t('selectServer.delete'), () => {
+            if (this.servers.length > 1) {
+                this.servers.splice(this.selectedServerIdx, 1);
+                this.selectedServerIdx = 0;
+                renderServers();
+            }
+        }, 140));
+        row2.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 140));
+
+        footer.style.flexDirection = 'column';
+        footer.appendChild(row1);
+        footer.appendChild(row2);
+    }
+
+            buildRealmsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('menu.online'),
+            'com/mojang/realmsclient/gui/screens/RealmsNotificationsScreen'
+        );
+        const box = document.createElement('div');
+        box.className = 'mc-form-stack';
+        box.style.textAlign = 'center';
+        const img = document.createElement('img');
+        img.src = 'assets/gui/realms.png';
+        img.style.height = '44px';
+        img.style.imageRendering = 'pixelated';
+        box.appendChild(img);
+        const msg = document.createElement('div');
+        msg.style.maxWidth = '420px';
+        msg.style.lineHeight = '1.6';
+        msg.textContent = 'Minecraft Realms (Protocol 777 • DataVersion 5023). Sign in with Microsoft OAuth 2.0 in the Multiplayer screen or start a Singleplayer world.';
+        box.appendChild(msg);
+        body.appendChild(box);
+        footer.appendChild(this.createButton(t('gui.back'), () => this.navigateBack(), 200));
+    }
+
+            buildCreditsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('options.credits_and_attribution'),
+            'net/minecraft/client/gui/screens/CreditsAndAttributionScreen'
+        );
+        const box = document.createElement('div');
+        box.className = 'mc-form-stack';
+        box.style.textAlign = 'center';
+        box.innerHTML = `
+            <div><b>Minecraft 26.3 (Protocol 777 • DataVersion 5023)</b></div>
+            <div style="color:#cccccc;">Copyright Mojang AB. Do not distribute!</div>
+            <div style="font-size:12px;color:#aaaaaa;max-width:460px;line-height:1.5;">
+                Transpiled from .minecraft/versions/26.3/26.3.jar (Java 25 Classfile v69.0) via TeaVM / WebAssembly Bytecode Engine &amp; WebGPU/WebGL2 Platform Abstraction Layer.
+            </div>
+        `;
+        body.appendChild(box);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+            buildConfirmQuitScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('menu.quit'),
+            'net/minecraft/client/gui/screens/ConfirmScreen'
+        );
+        const msg = document.createElement('div');
+        msg.textContent = 'Are you sure you want to quit Minecraft 26.3 and close this browser tab?';
+        body.appendChild(msg);
+
+        footer.appendChild(this.createButton(t('menu.quit'), () => {
+            window.close();
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 6. IN-GAME PAUSE MENU & SUB-SCREENS (`PauseScreen`, `AdvancementsScreen`, `StatsScreen`, `ShareToLanScreen`)
+    // =========================================================================
+
+            buildPauseScreen(t                                                        )       {
+        const { body } = this.createScreenFrame(
+            t('menu.game'),
+            'net/minecraft/client/gui/screens/PauseScreen'
+        );
+
+        const stack = document.createElement('div');
+        stack.className = 'mc-form-stack';
+
+        stack.appendChild(this.createButton(t('menu.returnToGame'), () => this.openScreen('none', false), 204));
+
+        const row1 = document.createElement('div');
+        row1.className = 'mc-btn-row';
+        row1.appendChild(this.createButton(t('gui.advancements'), () => this.openScreen('advancements'), 98));
+        row1.appendChild(this.createButton(t('gui.stats'), () => this.openScreen('statistics'), 98));
+        stack.appendChild(row1);
+
+        const row2 = document.createElement('div');
+        row2.className = 'mc-btn-row';
+        row2.appendChild(this.createButton(t('menu.sendFeedback'), () => this.openScreen('credits'), 98));
+        row2.appendChild(this.createButton(t('menu.reportBugs'), () => this.openScreen('credits'), 98));
+        stack.appendChild(row2);
+
+        const row3 = document.createElement('div');
+        row3.className = 'mc-btn-row';
+        row3.appendChild(this.createButton(t('menu.options'), () => this.openScreen('options'), 98));
+        row3.appendChild(this.createButton(
+            this.lanPort ? `LAN: :${this.lanPort}` : t('menu.shareToLan'),
+            () => this.openScreen('share_to_lan'),
+            98
+        ));
+        stack.appendChild(row3);
+
+        stack.appendChild(this.createButton(t('menu.returnToMenu'), async () => {
+            await this.callbacks.onSaveAndQuitToTitle();
+            this.inWorld = false;
+            this.openScreen('title', false);
+        }, 204));
+
+        body.appendChild(stack);
+    }
+
+            buildAdvancementsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('gui.advancements'),
+            'net/minecraft/client/gui/screens/advancements/AdvancementsScreen'
+        );
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        const advs = [
+            { tab: 'Minecraft', title: 'Minecraft', desc: 'The heart and story of the game', done: true },
+            { tab: 'Minecraft', title: 'Stone Age', desc: 'Mine stone with your new pickaxe', done: true },
+            { tab: 'Adventure', title: 'Adventure', desc: 'Adventure, exploration and combat', done: true },
+            { tab: 'Adventure', title: 'Into the Sulfur Caves (26.3)', desc: 'Discover Sulfur, Potent Sulfur, and a Sulfur Cube in Minecraft 26.3', done: true },
+            { tab: 'Husbandry', title: 'The Parrots and the Bats', desc: 'Breed two animals together', done: false },
+            { tab: 'Nether', title: 'We Need to Go Deeper', desc: 'Build, light and enter a Nether Portal', done: false },
+            { tab: 'The End', title: 'Free the End', desc: 'Good luck', done: false },
+        ];
+        for (const a of advs) {
+            const row = document.createElement('div');
+            row.className = 'mc-list-row';
+            row.innerHTML = `
+                <div><b>[${a.tab}] ${a.title}</b><div style="font-size:11px;color:#aaa;">${a.desc}</div></div>
+                <span style="color:${a.done ? '#7efc20' : '#888888'};">${a.done ? 'Completed' : 'In Progress'}</span>
+            `;
+            listBox.appendChild(row);
+        }
+        body.appendChild(listBox);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+            buildStatisticsScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('gui.stats'),
+            'net/minecraft/client/gui/screens/achievement/StatsScreen'
+        );
+        const stats = this.callbacks.getPlayerStats();
+        const listBox = document.createElement('div');
+        listBox.className = 'mc-scroll-list';
+        for (const [k, v] of Object.entries(stats)) {
+            const row = document.createElement('div');
+            row.className = 'mc-list-row';
+            row.innerHTML = `<span>${k}</span><b>${v}</b>`;
+            listBox.appendChild(row);
+        }
+        body.appendChild(listBox);
+        footer.appendChild(this.createButton(t('gui.done'), () => this.navigateBack(), 200));
+    }
+
+            buildShareToLanScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            t('lanServer.title'),
+            'net/minecraft/client/gui/screens/PauseScreen'
+        );
+        const w = this.draftWorld;
+        const stack = document.createElement('div');
+        stack.className = 'mc-form-stack';
+
+        const modes                                 = ['survival', 'creative'];
+        stack.appendChild(this.createButton(
+            `${t('selectWorld.gameMode')}: ${t('selectWorld.gameMode.' + w.gameMode)}`,
+            () => {
+                w.gameMode = modes[(modes.indexOf(w.gameMode === 'creative' ? 'creative' : 'survival') + 1) % modes.length];
+                this.renderCurrentScreenDom();
+            },
+            200
+        ));
+        stack.appendChild(this.createButton(
+            `${t('selectWorld.allowCommands')}: ${w.allowCommands ? t('options.on') : t('options.off')}`,
+            () => {
+                w.allowCommands = !w.allowCommands;
+                this.renderCurrentScreenDom();
+            },
+            200
+        ));
+
+        body.appendChild(stack);
+        footer.appendChild(this.createButton(t('lanServer.start'), () => {
+            this.lanPort = 25565 + Math.floor(Math.random() * 1000);
+            this.navigateBack();
+        }, 150));
+        footer.appendChild(this.createButton(t('gui.cancel'), () => this.navigateBack(), 150));
+    }
+
+    // =========================================================================
+    // 7. CREATIVE INVENTORY REGISTRY BROWSER (`CreativeModeInventoryScreen`)
+    // =========================================================================
+
+            buildCreativeInventoryScreen(t                                                        )       {
+        const { body, footer } = this.createScreenFrame(
+            'Creative Mode Inventory (1,288 Blocks & 1,253 Items)',
+            'net/minecraft/client/gui/screens/inventory/CreativeModeInventoryScreen'
+        );
+
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.className = 'mc-text-field';
+        searchInput.style.width = '340px';
+        searchInput.style.marginBottom = '8px';
+        searchInput.placeholder = 'Search 26.3 blocks (e.g. sulfur, pale_oak, cherry, diamond, deepslate)...';
+        body.appendChild(searchInput);
+
+        const grid = document.createElement('div');
+        grid.className = 'mc-creative-grid';
+        body.appendChild(grid);
+
+        const allBlocks = this.callbacks.getAllBlocks();
+        const uvs = this.callbacks.getBlockUvs();
+
+        const renderCells = (q        ) => {
+            grid.innerHTML = '';
+            const cleanQ = q.trim().toLowerCase();
+            const matches = allBlocks.filter(b => !b.properties.air && (!cleanQ || b.name.includes(cleanQ))).slice(0, 180);
+            for (const blk of matches) {
+                const cell = document.createElement('div');
+                cell.className = 'mc-creative-cell';
+                cell.title = `minecraft:${blk.name} (#${blk.rawId})`;
+
+                const icon = document.createElement('div');
+                icon.className = 'mc-creative-icon';
+                const uv = uvs[blk.textures.north] || uvs[blk.textures.up];
+                if (uv) {
+                    icon.style.backgroundImage = 'url(assets/blocks.png)';
+                    icon.style.backgroundPosition = `-${uv.x * 2}px -${uv.y * 2}px`;
+                    icon.style.backgroundSize = '2048px 1024px';
+                }
+
+                const lbl = document.createElement('span');
+                lbl.textContent = t(`block.minecraft.${blk.name}`) !== `block.minecraft.${blk.name}`
+                    ? t(`block.minecraft.${blk.name}`)
+                    : blk.name.replace(/_/g, ' ');
+                cell.appendChild(icon);
+                cell.appendChild(lbl);
+
+                cell.addEventListener('click', () => {
+                    this.callbacks.onSelectHotbarBlock(this.callbacks.getSelectedHotbarSlot(), blk);
+                    this.playClick();
+                    this.openScreen('none', false);
+                });
+                grid.appendChild(cell);
+            }
+        };
+
+        searchInput.addEventListener('input', () => renderCells(searchInput.value));
+        renderCells('');
+
+        footer.appendChild(this.createButton(t('gui.done'), () => this.openScreen('none', false), 200));
+    }
+}
+
+
 // --- Module: bootstrap.ts ---
 /**
  * Minecraft 26.3 (`protocol_version: 777`, `world_version: 5023`) Browser Client Bootstrap
  *
  * Orchestrates:
- * 1. Asset & Registry loading (`registries.json`, `worldgen.json`, `shaders.json`, `blocks.png`,
- *    `items.png`, `ascii.png`, `.nbt` structures, `mc26_3_core.wasm`, and `epoxy.wasm`).
- * 2. Dual WebGPU (Primary) / WebGL2 (Fallback) Rendering Engine across all 8 render passes.
- * 3. Fixed 20 TPS (50ms) Client Tick Loop decoupled from variable `requestAnimationFrame` delta-time
- *    via partial tick $\Delta t \in [0, 1]$ interpolation.
- * 4. Pointer Lock API mouse look, WASD movement, Space jump, Double-Space creative flight, Shift sneak,
- *    Ctrl sprint, Left-click block break / entity attack, Right-click block placement / Chest interaction,
- *    Middle-click pick-block, Scroll / 1–9 hotbar selection, `E` Full Creative Registry Browser (all 1,288
- *    blocks & 1,253 items with live search), `F3` Debug Overlay, and `M` Wispcraft Multiplayer & Microsoft OAuth2 modal.
+ * 1. Authentic Boot Sequence: `Main.main()` -> `SplashOverlay` (`LoadingOverlay`) -> `TitleScreen`
+ *    with 6-face rotating Panorama cubemap (`panorama_0.png`..`panorama_5.png`), `minecraft.png` logo,
+ *    and bouncing yellow splash text from `splashes.txt`.
+ * 2. JVM Classfile v69.0 Bytecode Transpilation Engine (`bytecode_gui.json`) & Platform Abstraction
+ *    Layer (`PlatformAbstractionLayer`) with persistent `options.txt`, 143-language `I18n`,
+ *    IndexedDB/OPFS Singleplayer World Management, and `.zip` Resource Pack loader.
+ * 3. Full Vanilla Screen Hierarchy (`VanillaScreenManager`): `TitleScreen`, `SelectWorldScreen`,
+ *    `CreateWorldScreen` (`Game`, `World`, `More` tabs), `CreateFlatWorldScreen`, `PresetFlatWorldScreen`,
+ *    `CreateBuffetWorldScreen`, `WorldCreationGameRulesScreen`, `ExperimentsScreen`, `OptionsScreen`,
+ *    `VideoSettingsScreen`, `SoundOptionsScreen`, `ControlsScreen`, `MouseSettingsScreen`, `KeyBindsScreen`,
+ *    `LanguageSelectScreen`, `PackSelectionScreen`, `SkinCustomizationScreen`, `ChatOptionsScreen`,
+ *    `AccessibilityOptionsScreen`, `PauseScreen`, `AdvancementsScreen`, `StatsScreen`, `ShareToLanScreen`,
+ *    and `CreativeModeInventoryScreen`.
+ * 4. Dual WebGPU (Primary) / WebGL2 (Fallback) Rendering Engine & Fixed 20 TPS (50ms) Client Tick Loop.
  */
+
+
 
 
 
@@ -6503,19 +10286,50 @@ function loadImage(url        )                            {
     });
 }
 
+function parseWorldSeedBigInt(seedStr        )         {
+    const trimmed = seedStr.trim();
+    if (!trimmed) {
+        return BigInt(Math.floor(Math.random() * 0x7fffffff));
+    }
+    if (/^-?\d+$/.test(trimmed)) {
+        try {
+            return BigInt(trimmed);
+        } catch {}
+    }
+    let h = 0xcbf29ce484222325n;
+    for (let i = 0; i < trimmed.length; i++) {
+        h ^= BigInt(trimmed.charCodeAt(i));
+        h = BigInt.asUintN(64, h * 0x100000001b3n);
+    }
+    return BigInt.asIntN(64, h);
+}
+
 class Minecraft263ClientApp {
             registries                   ;
             worldgenData                   ;
+            defaultStructureTemplate                               = null;
+            blocksImg                   ;
+            itemsImg                   ;
+            asciiImg                   ;
+
             world              ;
             mesher              ;
             renderer                   ;
             audio = new OpenALAudioEngine();
             vfs = new BrowserVFS();
             workerPool = new ThreadedWorkerPool();
+            pal                           ;
+            gui                       ;
+
             wisp = WispEpoxyClient.getOrCreate('wss://anura.pro/');
             msaAuth = new MicrosoftAuthenticator(this.wisp);
             netClient                                    = null;
             profile                   = MicrosoftAuthenticator.createOfflineProfile('Player26_3');
+
+    // Active Singleplayer World State
+            inWorld = false;
+            currentWorldSummary                           = null;
+            modifiedBlocksMap                      = new Map();
 
     // Player Physics State (20 TPS + partialTick interpolation)
             px = 8.5;
@@ -6536,37 +10350,81 @@ class Minecraft263ClientApp {
             isSwinging = false;
             stepDistanceAccum = 0;
 
-    // Input & UI State
+    // Input & HUD State
             keysDown              = new Set();
             selectedHotbarSlot = 0;
             hotbarBlocks                       = [];
-            showF3Debug = true;
-            isInventoryOpen = false;
-            isMultiplayerOpen = false;
-            renderDistanceChunks = 4;
+            showF3Debug = false;
+            hideGuiF1 = false;
+            sneakLatched = false;
+            sprintLatched = false;
+
+    // Player Statistics (`StatsScreen`)
+            playerStats                         = {
+        blocks_mined: 0,
+        blocks_placed: 0,
+        jumps: 0,
+        distance_walked_cm: 0,
+        ticks_played: 0,
+        mobs_hit: 0,
+    };
 
     // Loop Telemetry
             fps = 60;
             frameCounter = 0;
             lastFpsUpdateMs = performance.now();
             lastFrameTimeMs = performance.now();
+            lastRenderedFrameMs = 0;
             tickAccumulatorMs = 0;
 
            async start()                {
-        const setProgress = (pct        , text        ) => {
-            const bar = document.getElementById('loading-bar-fill');
-            const label = document.getElementById('loading-status');
-            if (bar) bar.style.width = `${pct}%`;
-            if (label) label.textContent = text;
-        };
+        this.pal = new PlatformAbstractionLayer(this.vfs, this.audio);
 
-        setProgress(10, 'Initializing JVM-to-WASM Core (mc26_3_core.wasm) & Epoxy Wisp...');
+        const guiRoot = document.getElementById('vanilla-gui-root')               ;
+        const bgCanvas = document.getElementById('gui-bg-canvas')                     ;
+        this.gui = new VanillaScreenManager(
+            this.pal,
+            {
+                onStartWorld: (cfg) => this.startSingleplayerWorld(cfg),
+                onSaveAndQuitToTitle: () => this.saveAndQuitToTitle(),
+                onVideoOptionsChanged: (backendSwitch) => this.applyOptionsToEngine(backendSwitch),
+                onSelectHotbarBlock: (slot, block) => {
+                    this.hotbarBlocks[slot] = block;
+                },
+                getHotbarBlocks: () => this.hotbarBlocks,
+                getSelectedHotbarSlot: () => this.selectedHotbarSlot,
+                getBlockUvs: () => this.registries?.atlases.blocks.uvs || {},
+                getAllBlocks: () => this.registries?.blocks || [],
+                getAllBiomes: () => this.registries?.biomes || [],
+                getPlayerStats: () => this.playerStats,
+                onPingMultiplayer: (wispUrl, serverAddr, setLog) => this.pingMultiplayer(wispUrl, serverAddr, setLog),
+                onConnectMultiplayer: (wispUrl, serverAddr, username, setLog) =>
+                    this.connectMultiplayer(wispUrl, serverAddr, username, setLog),
+                onMsaLogin: (wispUrl, setLog, onName) => this.loginMicrosoft(wispUrl, setLog, onName),
+            },
+            guiRoot,
+            bgCanvas
+        );
+
+        // Start animation loop immediately so `SplashOverlay` (`LoadingOverlay`) renders Mojang Red bar & logo
+        requestAnimationFrame((t) => this.frameLoop(t));
+
+        this.gui.setSplashProgress(10, 'Initializing JVM-to-WASM Core (mc26_3_core.wasm) & Epoxy Wisp...');
         await JvmWasmCore.init('assets/mc26_3_core.wasm');
         await this.wisp.initEpoxyWasm('assets/epoxy.wasm');
         await this.vfs.init();
         this.workerPool.initInlineWorkers();
 
-        setProgress(28, 'Loading Minecraft 26.3 Registries (1,288 Blocks, 1,253 Items, 162 Entities, 67 Biomes)...');
+        this.gui.setSplashProgress(26, 'Loading JVM Classfile v69.0 Bytecode (bytecode_gui.json) & I18n...');
+        let enUsDict                         = {};
+        try {
+            const enResp = await fetch('assets/lang/en_us.json');
+            if (enResp.ok) enUsDict = await enResp.json();
+        } catch {}
+        await this.pal.init('assets/bytecode_gui.json', enUsDict);
+        await this.gui.loadGuiTextures();
+
+        this.gui.setSplashProgress(48, 'Loading Minecraft 26.3 Registries (1,288 Blocks, 1,253 Items, 67 Biomes)...');
         const [regResp, wgResp] = await Promise.all([
             fetch('assets/registries.json'),
             fetch('assets/worldgen.json'),
@@ -6575,36 +10433,42 @@ class Minecraft263ClientApp {
         this.worldgenData = await wgResp.json();
         this.audio.setSoundEventsRegistry(this.registries.soundEvents);
 
-        setProgress(52, 'Loading Stitched Texture Atlases (blocks.png, items.png, ascii.png)...');
+        this.gui.setSplashProgress(70, 'Loading Stitched Texture Atlases (blocks.png, items.png, ascii.png)...');
         const [blocksImg, itemsImg, asciiImg] = await Promise.all([
             loadImage('assets/blocks.png'),
             loadImage('assets/items.png'),
             loadImage('assets/ascii.png'),
         ]);
+        this.blocksImg = blocksImg;
+        this.itemsImg = itemsImg;
+        this.asciiImg = asciiImg;
 
-        setProgress(70, 'Initializing Dual WebGPU / WebGL2 Rendering Pipeline...');
+        this.gui.setSplashProgress(86, 'Initializing Dual WebGPU / WebGL2 Rendering Pipeline...');
         const canvas3D = document.getElementById('game-canvas-3d')                     ;
         const canvasGui = document.getElementById('game-canvas-gui')                     ;
         this.renderer = new DualRenderEngine(canvas3D, canvasGui);
         this.renderer.resize(window.innerWidth, window.innerHeight);
-        await this.renderer.init(blocksImg, itemsImg, asciiImg);
+        await this.renderer.init(
+            blocksImg,
+            itemsImg,
+            asciiImg,
+            this.pal.options.preferredGraphicsBackend
+        );
 
-        setProgress(82, 'Constructing Worldgen NoiseRouter, Splines, and Structure Templates (.nbt)...');
-        const noiseRouter = new WorldgenNoiseRouter(2632026n, this.worldgenData);
-        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, noiseRouter);
-        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
-
-        // Load sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
+        // Preload sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
         try {
             const nbtResp = await fetch('assets/structures/abandoned_camp__camp__dappled_forest__campsite_dappled_forest_1.nbt');
             if (nbtResp.ok) {
                 const nbtBytes = new Uint8Array(await nbtResp.arrayBuffer());
-                const tmpl = await parseStructureTemplateNbt(nbtBytes);
-                this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', tmpl);
+                this.defaultStructureTemplate = await parseStructureTemplateNbt(nbtBytes);
             }
         } catch {}
 
-        // Populate initial 9-slot hotbar featuring iconic & new Minecraft 26.3 blocks
+        // Construct initial idle ClientWorld for background / hotbar reference before user selects a world
+        const initialRouter = new WorldgenNoiseRouter(2632026n, this.worldgenData);
+        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, initialRouter);
+        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
+
         const pickBlock = (name        ) =>
             this.world.blockByName.get(name) || this.registries.blocks[1];
         this.hotbarBlocks = [
@@ -6619,120 +10483,21 @@ class Minecraft263ClientApp {
             pickBlock('glowstone'),
         ];
 
-        setProgress(92, 'Generating Initial Spawn Chunks & Meshing Compact 32-Byte Vertices...');
-        for (let cx = -2; cx <= 2; cx++) {
-            for (let cz = -2; cz <= 2; cz++) {
-                const col = this.world.getOrCreateChunk(cx, cz);
-                const mesh = this.mesher.buildChunkMesh(col);
-                this.renderer.uploadChunkMesh(mesh);
-            }
-        }
+        await this.applyOptionsToEngine(false);
+        this.bindGlobalControls();
 
-        // Spawn a 26.3 Sulfur Cube right in front of the player so it's immediately visible!
-        const spawnChunk = this.world.getOrCreateChunk(0, 0);
-        const spawnSurfY = spawnChunk.heightmap[(8 << 4) | 8];
-        this.px = 8.5;
-        this.py = spawnSurfY + 2.0;
-        this.pz = 8.5;
-        this.prevPx = this.px;
-        this.prevPy = this.py;
-        this.prevPz = this.pz;
-        this.world.spawnMob('sulfur_cube', this.px + 2.5, spawnSurfY + 2.0, this.pz - 4.5);
-        this.world.spawnMob('pig', this.px - 3.5, spawnSurfY + 2.0, this.pz - 5.0);
-
-        setProgress(100, 'Ready!');
-        setTimeout(() => {
-            const loadingScreen = document.getElementById('loading-overlay');
-            if (loadingScreen) loadingScreen.style.display = 'none';
-        }, 200);
-
-        this.bindControlsAndModals();
-        requestAnimationFrame((t) => this.frameLoop(t));
+        // Complete `SplashOverlay` -> fades out into `TitleScreen` (never skips TitleScreen!)
+        this.gui.openScreen('title', false);
+        this.gui.setSplashProgress(100, 'Ready — Transitioning to TitleScreen...');
     }
 
-            bindControlsAndModals()       {
-        const canvasGui = document.getElementById('game-canvas-gui')                     ;
+            async applyOptionsToEngine(backendSwitchRequested          )                {
+        const opts = this.pal.options;
+        this.pal.syncAudioOptions();
 
-        window.addEventListener('resize', () => {
-            this.renderer.resize(window.innerWidth, window.innerHeight);
-        });
+        if (!this.renderer || !this.mesher) return;
 
-        // Pointer Lock on canvas click
-        canvasGui.addEventListener('mousedown', (e) => {
-            if (this.isInventoryOpen || this.isMultiplayerOpen) return;
-            this.audio.ensureContext();
-            if (document.pointerLockElement !== canvasGui) {
-                canvasGui.requestPointerLock();
-                return;
-            }
-            this.handleMouseAction(e.button);
-        });
-
-        window.addEventListener('contextmenu', (e) => e.preventDefault());
-
-        document.addEventListener('mousemove', (e) => {
-            if (document.pointerLockElement !== canvasGui) return;
-            const sensitivity = 0.0022;
-            this.yawRad -= e.movementX * sensitivity;
-            this.pitchRad = Math.max(-Math.PI * 0.495, Math.min(Math.PI * 0.495, this.pitchRad - e.movementY * sensitivity));
-        });
-
-        window.addEventListener('wheel', (e) => {
-            if (this.isInventoryOpen || this.isMultiplayerOpen) return;
-            if (e.deltaY > 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 1) % 9;
-            else if (e.deltaY < 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 8) % 9;
-        });
-
-        window.addEventListener('keydown', (e) => {
-            if (this.isMultiplayerOpen && document.activeElement?.tagName === 'INPUT') {
-                if (e.code === 'Escape') this.toggleMultiplayerModal(false);
-                return;
-            }
-            if (this.isInventoryOpen && document.activeElement?.tagName === 'INPUT') {
-                if (e.code === 'Escape') this.toggleInventoryModal(false);
-                return;
-            }
-
-            if (e.code === 'F3') {
-                e.preventDefault();
-                this.showF3Debug = !this.showF3Debug;
-                return;
-            }
-            if (e.code === 'KeyE') {
-                e.preventDefault();
-                this.toggleInventoryModal(!this.isInventoryOpen);
-                return;
-            }
-            if (e.code === 'KeyM') {
-                e.preventDefault();
-                this.toggleMultiplayerModal(!this.isMultiplayerOpen);
-                return;
-            }
-            if (e.code.startsWith('Digit')) {
-                const num = parseInt(e.code.slice(5), 10);
-                if (num >= 1 && num <= 9) {
-                    this.selectedHotbarSlot = num - 1;
-                }
-            }
-            if (e.code === 'Space' && !this.keysDown.has('Space')) {
-                const now = performance.now();
-                if (now - this.lastSpaceTapMs < 280) {
-                    this.isFlying = !this.isFlying;
-                    this.vy = 0;
-                }
-                this.lastSpaceTapMs = now;
-            }
-            this.keysDown.add(e.code);
-        });
-
-        window.addEventListener('keyup', (e) => {
-            this.keysDown.delete(e.code);
-        });
-
-        // Bind Top Toolbar Buttons (Backend Toggle, Creative Inventory, Wispcraft Multiplayer)
-        document.getElementById('btn-toggle-backend')?.addEventListener('click', async () => {
-            const nextBackend                        = this.renderer.backend === 'WebGPU' ? 'WebGL2' : 'WebGPU';
-            // Recreate 3D canvas because a canvas bound to WebGPU cannot acquire a WebGL2 context and vice-versa
+        if (backendSwitchRequested && this.renderer.backend !== opts.preferredGraphicsBackend) {
             const oldCanvas = document.getElementById('game-canvas-3d') ;
             const newCanvas = document.createElement('canvas');
             newCanvas.id = 'game-canvas-3d';
@@ -6742,171 +10507,381 @@ class Minecraft263ClientApp {
 
             const guiCanvas = document.getElementById('game-canvas-gui')                     ;
             this.renderer = new DualRenderEngine(newCanvas, guiCanvas);
-            await this.renderer.init(
-                await loadImage('assets/blocks.png'),
-                await loadImage('assets/items.png'),
-                await loadImage('assets/ascii.png'),
-                nextBackend
-            );
-            // Re-upload active chunks
+            await this.renderer.init(this.blocksImg, this.itemsImg, this.asciiImg, opts.preferredGraphicsBackend);
+        }
+
+        const prevSmooth = this.mesher.smoothLighting;
+        this.mesher.smoothLighting = opts.smoothLighting;
+        this.renderer.gamma = opts.gamma;
+        this.renderer.cloudMode = opts.renderClouds;
+        this.renderer.cloudHeight = opts.cloudRange;
+        this.renderer.particlesMode = opts.particles;
+        this.renderer.entityShadows = opts.entityShadows;
+        this.renderer.entityDistanceScaling = opts.entityDistanceScaling;
+        this.renderer.guiScale = opts.guiScale;
+        this.renderer.mainHand = opts.mainHand;
+        this.renderer.attackIndicator = opts.attackIndicator;
+        this.renderer.activeSubtitles = this.audio.activeSubtitles;
+
+        if (this.inWorld && (prevSmooth !== opts.smoothLighting || backendSwitchRequested)) {
+            this.renderer.clearChunkMeshes();
             for (const col of this.world.chunks.values()) {
                 this.renderer.uploadChunkMesh(this.mesher.buildChunkMesh(col));
             }
-            const btn = document.getElementById('btn-toggle-backend');
-            if (btn) btn.textContent = `Backend: ${this.renderer.backend}`;
-        });
-
-        document.getElementById('btn-open-inventory')?.addEventListener('click', () => {
-            this.toggleInventoryModal(!this.isInventoryOpen);
-        });
-
-        document.getElementById('btn-open-multiplayer')?.addEventListener('click', () => {
-            this.toggleMultiplayerModal(!this.isMultiplayerOpen);
-        });
-
-        this.setupInventoryBrowserUI();
-        this.setupMultiplayerModalUI();
+        }
     }
 
-            setupInventoryBrowserUI()       {
-        const searchInput = document.getElementById('inv-search-input')                           ;
-        const grid = document.getElementById('inv-grid');
-        const closeBtn = document.getElementById('btn-close-inventory');
+    /**
+     * Launches a Singleplayer World (`SelectWorldScreen` -> Play or `CreateWorldScreen` -> Create New World).
+     */
+            async startSingleplayerWorld(worldConfig                   )                {
+        this.currentWorldSummary = worldConfig;
+        this.currentWorldSummary.lastPlayedMs = Date.now();
+        await this.pal.persistSavedWorlds();
 
-        closeBtn?.addEventListener('click', () => this.toggleInventoryModal(false));
+        const seedBig = parseWorldSeedBigInt(worldConfig.seed);
+        const router = new WorldgenNoiseRouter(seedBig, this.worldgenData);
+        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, router, {
+            worldType: worldConfig.worldType,
+            flatLayers: worldConfig.flatLayers,
+            flatBiome: worldConfig.flatBiome,
+            singleBiome: worldConfig.singleBiome,
+            generateStructures: worldConfig.generateStructures,
+            bonusChest: worldConfig.bonusChest,
+            gameRules: worldConfig.gameRules,
+        });
 
-        const renderGrid = (query        ) => {
-            if (!grid) return;
-            grid.innerHTML = '';
-            const q = query.trim().toLowerCase();
-            const matches = this.registries.blocks.filter(b => !b.properties.air && (!q || b.name.includes(q))).slice(0, 180);
-            for (const blk of matches) {
-                const cell = document.createElement('div');
-                cell.className = 'inv-cell';
-                cell.title = `minecraft:${blk.name} (#${blk.rawId})`;
+        if (this.defaultStructureTemplate && worldConfig.generateStructures) {
+            this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', this.defaultStructureTemplate);
+        }
 
-                const icon = document.createElement('div');
-                icon.className = 'inv-icon';
-                const uv = this.registries.atlases.blocks.uvs[blk.textures.north] || this.registries.atlases.blocks.uvs[blk.textures.up];
-                if (uv) {
-                    icon.style.backgroundImage = 'url(assets/blocks.png)';
-                    icon.style.backgroundPosition = `-${uv.x * 2}px -${uv.y * 2}px`;
-                    icon.style.backgroundSize = `${this.registries.atlases.blocks.width * 2}px ${this.registries.atlases.blocks.height * 2}px`;
+        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
+        this.mesher.smoothLighting = this.pal.options.smoothLighting;
+        this.renderer.clearChunkMeshes();
+
+        // Generate initial 5x5 chunk grid around (0, 0)
+        for (let cx = -2; cx <= 2; cx++) {
+            for (let cz = -2; cz <= 2; cz++) {
+                this.world.getOrCreateChunk(cx, cz);
+            }
+        }
+
+        // Apply saved block diffs if reopening an existing world
+        this.modifiedBlocksMap.clear();
+        if (worldConfig.blockDiffs) {
+            for (const [bx, by, bz, blockId] of worldConfig.blockDiffs) {
+                this.world.setBlockId(bx, by, bz, blockId, false);
+                this.modifiedBlocksMap.set(`${bx},${by},${bz}`, blockId);
+            }
+        }
+
+        const spawnChunk = this.world.getOrCreateChunk(0, 0);
+        const spawnSurfY = spawnChunk.heightmap[(8 << 4) | 8];
+
+        // Bonus chest placement on first load if requested
+        if (worldConfig.bonusChest && !worldConfig.playerState) {
+            const chestBlock = this.world.blockByName.get('chest');
+            const torchBlock = this.world.blockByName.get('torch');
+            if (chestBlock) {
+                this.world.setBlockId(8, spawnSurfY + 1, 6, chestBlock.rawId, false);
+                if (torchBlock) {
+                    this.world.setBlockId(7, spawnSurfY + 1, 6, torchBlock.rawId, false);
+                    this.world.setBlockId(9, spawnSurfY + 1, 6, torchBlock.rawId, false);
                 }
-
-                const lbl = document.createElement('span');
-                lbl.textContent = blk.name.replace(/_/g, ' ');
-                cell.appendChild(icon);
-                cell.appendChild(lbl);
-
-                cell.addEventListener('click', () => {
-                    this.hotbarBlocks[this.selectedHotbarSlot] = blk;
-                    this.audio.playSoundEvent('ui.button.click', SoundSource.MASTER, 0, 0, 0, 0.7, 1.0, false);
-                    this.toggleInventoryModal(false);
-                });
-                grid.appendChild(cell);
             }
-        };
+        }
 
-        searchInput?.addEventListener('input', () => renderGrid(searchInput.value));
-        renderGrid('');
+        // Upload chunk meshes to GPU
+        for (const col of this.world.chunks.values()) {
+            const mesh = this.mesher.buildChunkMesh(col);
+            this.renderer.uploadChunkMesh(mesh);
+        }
+
+        if (worldConfig.playerState) {
+            this.px = worldConfig.playerState.x;
+            this.py = worldConfig.playerState.y;
+            this.pz = worldConfig.playerState.z;
+            this.yawRad = worldConfig.playerState.yawRad;
+            this.pitchRad = worldConfig.playerState.pitchRad;
+        } else {
+            this.px = 8.5;
+            this.py = spawnSurfY + 2.0;
+            this.pz = 8.5;
+            this.yawRad = 0;
+            this.pitchRad = 0;
+        }
+        this.prevPx = this.px;
+        this.prevPy = this.py;
+        this.prevPz = this.pz;
+        this.vx = 0;
+        this.vy = 0;
+        this.vz = 0;
+        this.isFlying = false;
+
+        // Spawn ambient mobs if do_mob_spawning is enabled
+        if (this.world.gameRules.do_mob_spawning !== false && worldConfig.worldType !== 'debug_all_block_states') {
+            this.world.spawnMob('sulfur_cube', this.px + 2.5, spawnSurfY + 2.0, this.pz - 4.5);
+            this.world.spawnMob('pig', this.px - 3.5, spawnSurfY + 2.0, this.pz - 5.0);
+        }
+
+        this.inWorld = true;
+        this.gui.inWorld = true;
+        this.audio.stopMenuMusic();
+
+        const canvasGui = document.getElementById('game-canvas-gui')                     ;
+        try {
+            canvasGui.requestPointerLock();
+        } catch {}
     }
 
-            setupMultiplayerModalUI()       {
-        const closeBtn = document.getElementById('btn-close-multiplayer');
-        const wispInput = document.getElementById('mp-wisp-url')                           ;
-        const serverInput = document.getElementById('mp-server-addr')                           ;
-        const usernameInput = document.getElementById('mp-username')                           ;
-        const statusBox = document.getElementById('mp-status-log');
-
-        const setLog = (msg        ) => {
-            if (statusBox) statusBox.textContent = msg;
-        };
-
-        closeBtn?.addEventListener('click', () => this.toggleMultiplayerModal(false));
-
-        // Microsoft OAuth 2.0 Device Code Button
-        document.getElementById('btn-msa-login')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                setLog('Requesting Microsoft OAuth 2.0 Device Code...');
-                const dc = await this.msaAuth.requestDeviceCode();
-                setLog(`${dc.message} (Polling for authorization...)`);
-                const tokens = await this.msaAuth.pollDeviceCodeToken(dc.deviceCode, dc.interval, setLog);
-                setLog('Exchanging Microsoft Token -> Xbox Live -> XSTS -> Minecraft Services...');
-                this.profile = await this.msaAuth.authenticateMinecraftWithMsaToken(tokens.accessToken, tokens.refreshToken);
-                if (usernameInput) usernameInput.value = this.profile.name;
-                setLog(`Authenticated as ${this.profile.name} (UUID: ${this.profile.id})`);
-            } catch (err) {
-                setLog(`Microsoft OAuth Notice: ${(err         ).message}`);
+    /**
+     * Saves the active Singleplayer world state (`playerState` & `blockDiffs`) to OPFS/IndexedDB
+     * and returns cleanly to `TitleScreen`.
+     */
+            async saveAndQuitToTitle()                {
+        if (this.currentWorldSummary) {
+            const diffs                                          = [];
+            for (const [k, v] of this.modifiedBlocksMap.entries()) {
+                const [bx, by, bz] = k.split(',').map(Number);
+                diffs.push([bx, by, bz, v]);
             }
-        });
+            this.currentWorldSummary.playerState = {
+                x: this.px,
+                y: this.py,
+                z: this.pz,
+                yawRad: this.yawRad,
+                pitchRad: this.pitchRad,
+            };
+            this.currentWorldSummary.blockDiffs = diffs;
+            this.currentWorldSummary.lastPlayedMs = Date.now();
+            await this.pal.persistSavedWorlds();
+        }
 
-        // Ping Server Status (Protocol 777 Status State 1)
-        document.getElementById('btn-mp-ping')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                const addr = serverInput?.value.trim() || 'localhost:25565';
-                setLog(`Pinging ${addr} via Wisp (${this.wisp.wispUrl})...`);
-                const client = new MinecraftProtocol263Client(this.wisp);
-                const status = await client.pingServerStatus(addr);
-                const motd = typeof status.description === 'string'
-                    ? status.description
-                    : status.description.text || JSON.stringify(status.description);
-                setLog(`Online! Version: ${status.version.name} (Protocol ${status.version.protocol}) | Players: ${status.players.online}/${status.players.max} | RTT: ${status.latencyMs}ms | MOTD: ${motd}`);
-            } catch (err) {
-                setLog(`Ping error: ${(err         ).message}`);
-            }
-        });
-
-        // Connect to Server (Protocol 777 Handshake -> Login -> Configuration -> Play)
-        document.getElementById('btn-mp-connect')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                if (usernameInput?.value && this.profile.offlineMode) {
-                    this.profile = MicrosoftAuthenticator.createOfflineProfile(usernameInput.value);
-                }
-                const addr = serverInput?.value.trim() || 'localhost:25565';
-                this.netClient?.disconnect();
-                this.netClient = new MinecraftProtocol263Client(this.wisp, {
-                    onStatusUpdate: setLog,
-                    onLoginSuccess: (uuid, name) => setLog(`LoginSuccess: ${name} (${uuid})`),
-                    onEnterPlayState: () => {
-                        setLog(`Connected to ${addr} in Play State (Protocol 777)!`);
-                        setTimeout(() => this.toggleMultiplayerModal(false), 600);
-                    },
-                    onDisconnect: (reason) => setLog(`Disconnected: ${reason}`),
-                    onPlayerPosition: (x, y, z, yaw, pitch) => {
-                        this.px = x; this.py = y; this.pz = z;
-                        this.yawRad = (-yaw * Math.PI) / 180;
-                        this.pitchRad = (-pitch * Math.PI) / 180;
-                    },
-                    onBlockUpdate: (x, y, z, stateId) => {
-                        this.world.setBlockId(x, y, z, stateId % this.registries.blocks.length);
-                    },
-                });
-                await this.netClient.connectToServer(addr, this.profile);
-            } catch (err) {
-                setLog(`Connect error: ${(err         ).message}`);
-            }
-        });
-    }
-
-            toggleInventoryModal(open         )       {
-        this.isInventoryOpen = open;
-        const modal = document.getElementById('inventory-modal');
-        if (modal) modal.style.display = open ? 'flex' : 'none';
-        if (open && document.pointerLockElement) {
+        this.netClient?.disconnect();
+        this.netClient = null;
+        this.inWorld = false;
+        this.gui.inWorld = false;
+        this.renderer.clearChunkMeshes();
+        if (document.pointerLockElement) {
             document.exitPointerLock();
         }
     }
 
-            toggleMultiplayerModal(open         )       {
-        this.isMultiplayerOpen = open;
-        const modal = document.getElementById('multiplayer-modal');
-        if (modal) modal.style.display = open ? 'flex' : 'none';
-        if (open && document.pointerLockElement) {
-            document.exitPointerLock();
+            isKeyBoundPressed(actionKey        )          {
+        const boundCode = this.pal.options.getKeyCode(actionKey);
+        return boundCode ? this.keysDown.has(boundCode) : false;
+    }
+
+            bindGlobalControls()       {
+        const canvasGui = document.getElementById('game-canvas-gui')                     ;
+
+        window.addEventListener('resize', () => {
+            this.renderer.resize(window.innerWidth, window.innerHeight);
+        });
+
+        canvasGui.addEventListener('mousedown', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            this.audio.ensureContext();
+            if (document.pointerLockElement !== canvasGui) {
+                canvasGui.requestPointerLock();
+                return;
+            }
+            const mouseCode = `Mouse${e.button}`;
+            if (mouseCode === this.pal.options.getKeyCode('key.attack') || e.button === 0) {
+                this.handleMouseAction(0);
+            } else if (mouseCode === this.pal.options.getKeyCode('key.use') || e.button === 2) {
+                this.handleMouseAction(2);
+            } else if (mouseCode === this.pal.options.getKeyCode('key.pickItem') || e.button === 1) {
+                this.handleMouseAction(1);
+            }
+        });
+
+        window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        document.addEventListener('mousemove', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            if (document.pointerLockElement !== canvasGui) return;
+            const sensOption = this.pal.options.mouseSensitivity;
+            const f = sensOption * 0.6 + 0.2;
+            const sens = f * f * f * 0.008;
+            const invertMult = this.pal.options.invertYMouse ? -1 : 1;
+            this.yawRad -= e.movementX * sens;
+            this.pitchRad = Math.max(
+                -Math.PI * 0.495,
+                Math.min(Math.PI * 0.495, this.pitchRad - e.movementY * sens * invertMult)
+            );
+        });
+
+        window.addEventListener('wheel', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            if (e.deltaY > 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 1) % 9;
+            else if (e.deltaY < 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 8) % 9;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'SELECT') {
+                return;
+            }
+
+            const getKey = (id        ) => this.pal.options.getKeyCode(id);
+
+            if (e.code === getKey('key.fullscreen') || e.code === 'F11') {
+                e.preventDefault();
+                this.pal.options.fullscreen = !this.pal.options.fullscreen;
+                if (this.pal.options.fullscreen) document.documentElement.requestFullscreen?.().catch(() => {});
+                else document.exitFullscreen?.().catch(() => {});
+                this.pal.saveOptions();
+                return;
+            }
+
+            if (!this.inWorld) return;
+
+            if (e.code === getKey('key.toggleGui') || e.code === 'F1') {
+                e.preventDefault();
+                this.hideGuiF1 = !this.hideGuiF1;
+                return;
+            }
+
+            if (e.code === getKey('key.debug.overlay') || e.code === 'F3') {
+                e.preventDefault();
+                this.showF3Debug = !this.showF3Debug;
+                return;
+            }
+
+            if (e.code === getKey('key.inventory')) {
+                e.preventDefault();
+                if (this.gui.activeScreen === 'creative_inventory') {
+                    this.gui.openScreen('none', false);
+                    canvasGui.requestPointerLock();
+                } else if (this.gui.activeScreen === 'none') {
+                    this.gui.openScreen('creative_inventory', true);
+                }
+                return;
+            }
+
+            if (e.code === getKey('key.advancements')) {
+                e.preventDefault();
+                if (this.gui.activeScreen === 'advancements') {
+                    this.gui.openScreen('none', false);
+                    canvasGui.requestPointerLock();
+                } else if (this.gui.activeScreen === 'none') {
+                    this.gui.openScreen('advancements', true);
+                }
+                return;
+            }
+
+            // Hotbar 1..9
+            for (let i = 1; i <= 9; i++) {
+                if (e.code === getKey(`key.hotbar.${i}`)) {
+                    this.selectedHotbarSlot = i - 1;
+                }
+            }
+
+            // Toggle vs Hold Sneak / Sprint
+            if (e.code === getKey('key.sneak') && !this.keysDown.has(e.code) && this.pal.options.toggleCrouch) {
+                this.sneakLatched = !this.sneakLatched;
+            }
+            if (e.code === getKey('key.sprint') && !this.keysDown.has(e.code) && this.pal.options.toggleSprint) {
+                this.sprintLatched = !this.sprintLatched;
+            }
+
+            // Double-tap Jump for Creative/Commands flight
+            if (e.code === getKey('key.jump') && !this.keysDown.has(e.code)) {
+                const now = performance.now();
+                const canFly =
+                    !this.currentWorldSummary ||
+                    this.currentWorldSummary.gameMode === 'creative' ||
+                    this.currentWorldSummary.allowCommands;
+                if (canFly && now - this.lastSpaceTapMs < 280) {
+                    this.isFlying = !this.isFlying;
+                    this.vy = 0;
+                }
+                this.lastSpaceTapMs = now;
+            }
+
+            this.keysDown.add(e.code);
+        });
+
+        window.addEventListener('keyup', (e) => {
+            this.keysDown.delete(e.code);
+        });
+    }
+
+            async pingMultiplayer(wispUrl        , serverAddr        , setLog                       )                {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            setLog(`Pinging ${serverAddr} via Wisp (${this.wisp.wispUrl})...`);
+            const client = new MinecraftProtocol263Client(this.wisp);
+            const status = await client.pingServerStatus(serverAddr);
+            const motd =
+                typeof status.description === 'string'
+                    ? status.description
+                    : status.description.text || JSON.stringify(status.description);
+            setLog(
+                `Online! Version: ${status.version.name} (Protocol ${status.version.protocol}) | Players: ${status.players.online}/${status.players.max} | RTT: ${status.latencyMs}ms | MOTD: ${motd}`
+            );
+        } catch (err) {
+            setLog(`Ping error: ${(err         ).message}`);
+        }
+    }
+
+            async connectMultiplayer(
+        wispUrl        ,
+        serverAddr        ,
+        username        ,
+        setLog                       
+    )                {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            if (username && this.profile.offlineMode) {
+                this.profile = MicrosoftAuthenticator.createOfflineProfile(username);
+            }
+            this.netClient?.disconnect();
+            this.netClient = new MinecraftProtocol263Client(this.wisp, {
+                onStatusUpdate: setLog,
+                onLoginSuccess: (uuid, name) => setLog(`LoginSuccess: ${name} (${uuid})`),
+                onEnterPlayState: async () => {
+                    setLog(`Connected to ${serverAddr} in Play State (Protocol 777)!`);
+                    if (!this.inWorld && this.pal.savedWorlds.length > 0) {
+                        await this.startSingleplayerWorld(this.pal.savedWorlds[0]);
+                    }
+                    this.gui.openScreen('none', false);
+                },
+                onDisconnect: (reason) => setLog(`Disconnected: ${reason}`),
+                onPlayerPosition: (x, y, z, yaw, pitch) => {
+                    this.px = x;
+                    this.py = y;
+                    this.pz = z;
+                    this.yawRad = (-yaw * Math.PI) / 180;
+                    this.pitchRad = (-pitch * Math.PI) / 180;
+                },
+                onBlockUpdate: (x, y, z, stateId) => {
+                    this.world.setBlockId(x, y, z, stateId % this.registries.blocks.length);
+                },
+            });
+            await this.netClient.connectToServer(serverAddr, this.profile);
+        } catch (err) {
+            setLog(`Connect error: ${(err         ).message}`);
+        }
+    }
+
+            async loginMicrosoft(
+        wispUrl        ,
+        setLog                       ,
+        onName                        
+    )                {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            setLog('Requesting Microsoft OAuth 2.0 Device Code...');
+            const dc = await this.msaAuth.requestDeviceCode();
+            setLog(`${dc.message} (Polling for authorization...)`);
+            const tokens = await this.msaAuth.pollDeviceCodeToken(dc.deviceCode, dc.interval, setLog);
+            setLog('Exchanging Microsoft Token -> Xbox Live -> XSTS -> Minecraft Services...');
+            this.profile = await this.msaAuth.authenticateMinecraftWithMsaToken(tokens.accessToken, tokens.refreshToken);
+            onName(this.profile.name);
+            setLog(`Authenticated as ${this.profile.name} (UUID: ${this.profile.id})`);
+        } catch (err) {
+            setLog(`Microsoft OAuth Notice: ${(err         ).message}`);
         }
     }
 
@@ -6923,13 +10898,12 @@ class Minecraft263ClientApp {
         const hit = this.world.raycastBlock(this.px, eyeY, this.pz, fx, fy, fz, 5.5);
 
         if (button === 0) {
-            // Left click: Swing arm, check mob hit first, else break block
             this.isSwinging = true;
             this.swingProgress = 0;
 
             for (const ent of this.world.entities.values()) {
                 const dx = ent.x - this.px;
-                const dy = (ent.y + ent.height * 0.5) - eyeY;
+                const dy = ent.y + ent.height * 0.5 - eyeY;
                 const dz = ent.z - this.pz;
                 const dist = Math.hypot(dx, dy, dz);
                 if (dist < 4.0) {
@@ -6939,7 +10913,17 @@ class Minecraft263ClientApp {
                         ent.vy = 0.36;
                         ent.vx += fx * 0.4;
                         ent.vz += fz * 0.4;
-                        this.audio.playSoundEvent('entity.player.attack.strong', SoundSource.PLAYERS, ent.x, ent.y, ent.z, 1.0, 1.0, true);
+                        this.playerStats.mobs_hit = (this.playerStats.mobs_hit || 0) + 1;
+                        this.audio.playSoundEvent(
+                            'entity.player.attack.strong',
+                            SoundSource.PLAYERS,
+                            ent.x,
+                            ent.y,
+                            ent.z,
+                            1.0,
+                            1.0,
+                            true
+                        );
                         return;
                     }
                 }
@@ -6949,27 +10933,43 @@ class Minecraft263ClientApp {
                 const uv = this.mesher.getUV(hit.block.textures.north);
                 this.renderer.spawnBlockBreakParticles(hit.x, hit.y, hit.z, uv);
                 this.world.setBlockId(hit.x, hit.y, hit.z, this.world.idAir, true);
-                this.audio.playSoundEvent('block.stone.break', SoundSource.BLOCKS, hit.x + 0.5, hit.y + 0.5, hit.z + 0.5, 0.9, 0.95, true);
+                this.modifiedBlocksMap.set(`${hit.x},${hit.y},${hit.z}`, this.world.idAir);
+                this.playerStats.blocks_mined = (this.playerStats.blocks_mined || 0) + 1;
+                this.audio.playSoundEvent(
+                    'block.stone.break',
+                    SoundSource.BLOCKS,
+                    hit.x + 0.5,
+                    hit.y + 0.5,
+                    hit.z + 0.5,
+                    0.9,
+                    0.95,
+                    true
+                );
             }
         } else if (button === 2 && hit) {
-            // Right click: Place selected block at (hit.x + hit.nx, hit.y + hit.ny, hit.z + hit.nz)
             const tx = hit.x + hit.nx;
             const ty = hit.y + hit.ny;
             const tz = hit.z + hit.nz;
             const selected = this.hotbarBlocks[this.selectedHotbarSlot];
             if (!selected) return;
 
-            // Ensure placed block does not intersect player AABB
             const playerBox       = {
-                minX: this.px - 0.3, minY: this.py, minZ: this.pz - 0.3,
-                maxX: this.px + 0.3, maxY: this.py + 1.8, maxZ: this.pz + 0.3,
+                minX: this.px - 0.3,
+                minY: this.py,
+                minZ: this.pz - 0.3,
+                maxX: this.px + 0.3,
+                maxY: this.py + 1.8,
+                maxZ: this.pz + 0.3,
             };
             if (
                 !selected.properties.noCollision &&
                 !selected.properties.liquid &&
-                playerBox.maxX > tx && playerBox.minX < tx + 1 &&
-                playerBox.maxY > ty && playerBox.minY < ty + 1 &&
-                playerBox.maxZ > tz && playerBox.minZ < tz + 1
+                playerBox.maxX > tx &&
+                playerBox.minX < tx + 1 &&
+                playerBox.maxY > ty &&
+                playerBox.minY < ty + 1 &&
+                playerBox.maxZ > tz &&
+                playerBox.minZ < tz + 1
             ) {
                 return;
             }
@@ -6977,23 +10977,33 @@ class Minecraft263ClientApp {
             this.isSwinging = true;
             this.swingProgress = 0;
             this.world.setBlockId(tx, ty, tz, selected.rawId, true);
-            this.audio.playSoundEvent('block.stone.place', SoundSource.BLOCKS, tx + 0.5, ty + 0.5, tz + 0.5, 0.9, 1.05, true);
+            this.modifiedBlocksMap.set(`${tx},${ty},${tz}`, selected.rawId);
+            this.playerStats.blocks_placed = (this.playerStats.blocks_placed || 0) + 1;
+            this.audio.playSoundEvent(
+                'block.stone.place',
+                SoundSource.BLOCKS,
+                tx + 0.5,
+                ty + 0.5,
+                tz + 0.5,
+                0.9,
+                1.05,
+                true
+            );
         } else if (button === 1 && hit) {
-            // Middle click: Pick block into current hotbar slot
             this.hotbarBlocks[this.selectedHotbarSlot] = hit.block;
         }
     }
 
     /**
-     * Executes one fixed 20 TPS (50ms) client tick:
-     * - Steps player movement, jumping, creative flight, swimming, and VoxelShape AABB collisions
-     * - Steps world ticks (fluids, redstone, mobs)
-     * - Streams and remeshes dirty chunks around the player
+     * Executes one fixed 20 TPS (50ms) client tick when a world is active and not paused.
      */
             clientTick()       {
+        if (!this.inWorld || this.gui.activeScreen === 'pause') return;
+
         this.prevPx = this.px;
         this.prevPy = this.py;
         this.prevPz = this.pz;
+        this.playerStats.ticks_played = (this.playerStats.ticks_played || 0) + 1;
 
         if (this.isSwinging) {
             this.swingProgress += 0.22;
@@ -7003,14 +11013,13 @@ class Minecraft263ClientApp {
             }
         }
 
-        // Compute horizontal input vector relative to yaw
         let forwardInput = 0;
         let strafeInput = 0;
-        if (!this.isInventoryOpen && !this.isMultiplayerOpen) {
-            if (this.keysDown.has('KeyW')) forwardInput += 1;
-            if (this.keysDown.has('KeyS')) forwardInput -= 1;
-            if (this.keysDown.has('KeyD')) strafeInput += 1;
-            if (this.keysDown.has('KeyA')) strafeInput -= 1;
+        if (this.gui.activeScreen === 'none') {
+            if (this.isKeyBoundPressed('key.forward')) forwardInput += 1;
+            if (this.isKeyBoundPressed('key.back')) forwardInput -= 1;
+            if (this.isKeyBoundPressed('key.right')) strafeInput += 1;
+            if (this.isKeyBoundPressed('key.left')) strafeInput -= 1;
         }
 
         const len = Math.hypot(forwardInput, strafeInput);
@@ -7024,8 +11033,13 @@ class Minecraft263ClientApp {
         const wishX = -sinY * forwardInput + cosY * strafeInput;
         const wishZ = -cosY * forwardInput - sinY * strafeInput;
 
-        const isSprinting = this.keysDown.has('ControlLeft') || this.keysDown.has('ControlRight');
-        const isSneaking = this.keysDown.has('ShiftLeft') || this.keysDown.has('ShiftRight');
+        const isSprinting = this.pal.options.toggleSprint
+            ? this.sprintLatched
+            : this.isKeyBoundPressed('key.sprint');
+        const isSneaking = this.pal.options.toggleCrouch
+            ? this.sneakLatched
+            : this.isKeyBoundPressed('key.sneak');
+        const isJumping = this.gui.activeScreen === 'none' && this.isKeyBoundPressed('key.jump');
 
         const feetBlock = this.world.getBlockId(Math.floor(this.px), Math.floor(this.py), Math.floor(this.pz));
         const inWater = feetBlock === this.world.idWater;
@@ -7035,25 +11049,25 @@ class Minecraft263ClientApp {
             this.vx = this.vx * 0.6 + wishX * flySpeed * 0.4;
             this.vz = this.vz * 0.6 + wishZ * flySpeed * 0.4;
             this.vy = 0;
-            if (this.keysDown.has('Space')) this.vy = 0.35;
+            if (isJumping) this.vy = 0.35;
             if (isSneaking) this.vy = -0.35;
         } else if (inWater) {
             const swimSpeed = 0.14;
             this.vx = this.vx * 0.8 + wishX * swimSpeed * 0.2;
             this.vz = this.vz * 0.8 + wishZ * swimSpeed * 0.2;
             this.vy = (this.vy - 0.02) * 0.85;
-            if (this.keysDown.has('Space')) this.vy += 0.06;
+            if (isJumping) this.vy += 0.06;
         } else {
             const baseAccel = isSneaking ? 0.06 : isSprinting ? 0.165 : 0.12;
             const friction = this.onGround ? 0.546 : 0.91;
             this.vx = this.vx * friction + wishX * baseAccel;
             this.vz = this.vz * friction + wishZ * baseAccel;
 
-            if (this.keysDown.has('Space') && this.onGround) {
-                this.vy = 0.42; // Exact vanilla jump velocity
+            if (isJumping && this.onGround) {
+                this.vy = 0.42;
                 this.onGround = false;
+                this.playerStats.jumps = (this.playerStats.jumps || 0) + 1;
             }
-            // Vanilla gravity (0.08 blocks/tick^2) and vertical drag (0.98)
             this.vy = (this.vy - 0.08) * 0.98;
         }
 
@@ -7066,42 +11080,61 @@ class Minecraft263ClientApp {
             maxZ: this.pz + 0.3,
         };
         const moved = this.world.moveEntityWithCollisions(playerBox, this.vx, this.vy, this.vz);
-        this.px = (moved.box.minX + moved.box.maxX) * 0.5;
-        this.py = moved.box.minY;
-        this.pz = (moved.box.minZ + moved.box.maxZ) * 0.5;
-        this.onGround = moved.onGround;
+        const nextPx = (moved.box.minX + moved.box.maxX) * 0.5;
+        const nextPy = moved.box.minY;
+        const nextPz = (moved.box.minZ + moved.box.maxZ) * 0.5;
+
+        // Auto-Jump support (`options.autoJump`)
+        const horizBlocked =
+            Math.hypot(nextPx - this.px, nextPz - this.pz) < Math.hypot(this.vx, this.vz) * 0.5 &&
+            Math.hypot(wishX, wishZ) > 0.1;
+        if (this.pal.options.autoJump && this.onGround && horizBlocked && !isSneaking) {
+            this.vy = 0.42;
+            this.onGround = false;
+            this.playerStats.jumps = (this.playerStats.jumps || 0) + 1;
+        } else {
+            this.px = nextPx;
+            this.py = nextPy;
+            this.pz = nextPz;
+            this.onGround = moved.onGround;
+        }
+
         if (moved.onGround && this.vy < 0) {
             this.vy = 0;
             this.isFlying = false;
         }
 
-        // Footstep spatial sound trigger
+        const stepDist = Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+        this.playerStats.distance_walked_cm = (this.playerStats.distance_walked_cm || 0) + Math.round(stepDist * 100);
         if (this.onGround) {
-            this.stepDistanceAccum += Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+            this.stepDistanceAccum += stepDist;
             if (this.stepDistanceAccum > 1.85) {
                 this.stepDistanceAccum = 0;
                 this.audio.playSoundEvent('block.grass.step', SoundSource.PLAYERS, this.px, this.py, this.pz, 0.35, 1.0, false);
             }
         }
 
-        // Step world mechanics & particles
         this.world.tick(this.px, this.py, this.pz);
         this.renderer.stepParticles();
         this.workerPool.recordTickCompleted(Number(this.world.worldAgeTicks));
 
-        // Send multiplayer position update if connected
-        this.netClient?.sendPlayerPositionAndRotation(
-            this.px, this.py, this.pz,
-            (-this.yawRad * 180) / Math.PI,
-            (-this.pitchRad * 180) / Math.PI,
-            this.onGround
-        ).catch(() => {});
+        this.netClient
+            ?.sendPlayerPositionAndRotation(
+                this.px,
+                this.py,
+                this.pz,
+                (-this.yawRad * 180) / Math.PI,
+                (-this.pitchRad * 180) / Math.PI,
+                this.onGround
+            )
+            .catch(() => {});
 
-        // Stream & mesh nearby dirty chunks (at most 1 chunk per tick to avoid frame hitches)
+        // Stream & mesh nearby dirty chunks around the player according to `renderDistance`
+        const renderDist = Math.min(8, Math.max(2, this.pal.options.renderDistance));
         const pcx = Math.floor(this.px) >> 4;
         const pcz = Math.floor(this.pz) >> 4;
         let meshedThisTick = 0;
-        for (let r = 0; r <= this.renderDistanceChunks && meshedThisTick < 1; r++) {
+        for (let r = 0; r <= renderDist && meshedThisTick < 1; r++) {
             for (let dx = -r; dx <= r && meshedThisTick < 1; dx++) {
                 for (let dz = -r; dz <= r && meshedThisTick < 1; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
@@ -7121,40 +11154,86 @@ class Minecraft263ClientApp {
     }
 
             frameLoop(nowMs        )       {
+        requestAnimationFrame((t) => this.frameLoop(t));
+
+        // Max Framerate limiter (`options.maxFps` when < 260)
+        const maxFps = this.pal?.options.maxFps ?? 120;
+        if (maxFps < 260 && this.inWorld) {
+            const minFrameInterval = 1000 / Math.max(10, maxFps);
+            if (nowMs - this.lastRenderedFrameMs < minFrameInterval - 0.5) {
+                return;
+            }
+        }
+        this.lastRenderedFrameMs = nowMs;
+
         const dtMs = Math.min(250, Math.max(0, nowMs - this.lastFrameTimeMs));
         this.lastFrameTimeMs = nowMs;
-        this.tickAccumulatorMs += dtMs;
 
-        // Fixed 20 TPS (50ms) tick loop
+        // Render GUI background canvas (`SplashOverlay`, `TitleScreen` Panorama, and sinusoidal splash text bounce)
+        this.gui?.renderFrame(nowMs);
+
+        if (!this.inWorld || !this.renderer || !this.world) {
+            return;
+        }
+
+        this.tickAccumulatorMs += dtMs;
         while (this.tickAccumulatorMs >= 50.0) {
             this.clientTick();
             this.tickAccumulatorMs -= 50.0;
         }
 
-        // Partial tick interpolation factor in [0.0 .. 1.0]
-        const partialTick = this.tickAccumulatorMs / 50.0;
+        const partialTick = this.gui.activeScreen === 'pause' ? 0 : this.tickAccumulatorMs / 50.0;
+        const isSneaking = this.pal.options.toggleCrouch
+            ? this.sneakLatched
+            : this.isKeyBoundPressed('key.sneak');
+        const eyeHeight = isSneaking ? 1.27 : 1.62;
+
+        // View Bobbing offset (`options.bobView`)
+        let bobY = 0;
+        if (this.pal.options.bobView && this.onGround && !this.isFlying) {
+            const speed = Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+            bobY = Math.sin(this.stepDistanceAccum * Math.PI * 2.0) * Math.min(0.08, speed * 0.35);
+        }
+
         const renderX = this.prevPx + (this.px - this.prevPx) * partialTick;
-        const renderY = this.prevPy + (this.py - this.prevPy) * partialTick + 1.62;
+        const renderY = this.prevPy + (this.py - this.prevPy) * partialTick + eyeHeight + bobY;
         const renderZ = this.prevPz + (this.pz - this.prevPz) * partialTick;
 
-        this.audio.updateListener(renderX, renderY, renderZ, this.yawRad, this.pitchRad, this.vx * 20, this.vy * 20, this.vz * 20);
+        this.audio.updateListener(
+            renderX,
+            renderY,
+            renderZ,
+            this.yawRad,
+            this.pitchRad,
+            this.vx * 20,
+            this.vy * 20,
+            this.vz * 20
+        );
 
         const [fx, fy, fz] = this.getCameraForward();
         const hit = this.world.raycastBlock(renderX, renderY, renderZ, fx, fy, fz, 5.5);
 
-        // Render Passes 1–7 (3D World, Entities, BlockEntities, Particles, Sky/Clouds)
+        const baseFov = this.pal.options.fov || 70;
+        const isSprinting = this.pal.options.toggleSprint
+            ? this.sprintLatched
+            : this.isKeyBoundPressed('key.sprint');
+        const dynamicFov = baseFov + (isSprinting ? 10 * this.pal.options.fovEffectScale : 0);
+        const renderDist = Math.min(8, Math.max(2, this.pal.options.renderDistance));
+
         this.renderer.renderWorldFrame(
             this.world,
             this.mesher,
-            renderX, renderY, renderZ,
-            this.yawRad, this.pitchRad,
-            75.0,
-            this.renderDistanceChunks,
+            renderX,
+            renderY,
+            renderZ,
+            this.yawRad,
+            this.pitchRad,
+            dynamicFov,
+            renderDist,
             partialTick,
             hit
         );
 
-        // Update FPS counter
         this.frameCounter++;
         if (nowMs - this.lastFpsUpdateMs >= 500) {
             this.fps = Math.round((this.frameCounter * 1000) / (nowMs - this.lastFpsUpdateMs));
@@ -7162,7 +11241,12 @@ class Minecraft263ClientApp {
             this.lastFpsUpdateMs = nowMs;
         }
 
-        // Sample NoiseRouter values at player coordinates for F3 overlay
+        if (this.hideGuiF1) {
+            const guiCanvas = document.getElementById('game-canvas-gui')                     ;
+            guiCanvas.getContext('2d')?.clearRect(0, 0, guiCanvas.width, guiCanvas.height);
+            return;
+        }
+
         const nr = this.world.noiseRouter.sampleOverworldRouter(
             Math.floor(this.px),
             Math.floor(this.py),
@@ -7172,15 +11256,20 @@ class Minecraft263ClientApp {
             `C: ${nr.continents.toFixed(3)} E: ${nr.erosion.toFixed(3)} T: ${nr.temperature.toFixed(3)} ` +
             `V: ${nr.vegetation.toFixed(3)} W: ${nr.weirdness.toFixed(3)} PV: ${nr.ridges.toFixed(3)} D: ${nr.depth.toFixed(3)}`;
 
-        // Render Pass 8 (2D GUI, Hotbar, Health/Hunger/XP, Held Block, F3 Debug)
+        this.renderer.activeSubtitles = this.audio.activeSubtitles;
         this.renderer.render2DGuiPass({
             fps: this.fps,
             playerX: renderX,
-            playerY: renderY - 1.62,
+            playerY: renderY - eyeHeight,
             playerZ: renderZ,
             yawDeg: ((-this.yawRad * 180) / Math.PI) % 360,
             pitchDeg: (this.pitchRad * 180) / Math.PI,
-            biomeName: nr.biomeName,
+            biomeName:
+                this.world.worldType === 'flat'
+                    ? this.world.flatBiome
+                    : this.world.worldType === 'single_biome_surface'
+                    ? this.world.singleBiome
+                    : nr.biomeName,
             noiseSampleText,
             selectedHotbarSlot: this.selectedHotbarSlot,
             hotbarBlocks: this.hotbarBlocks,
@@ -7194,8 +11283,6 @@ class Minecraft263ClientApp {
             wispUrl: this.wisp.wispUrl,
             profileName: this.profile.name,
         });
-
-        requestAnimationFrame((t) => this.frameLoop(t));
     }
 }
 
@@ -7203,8 +11290,6 @@ window.addEventListener('DOMContentLoaded', () => {
     const app = new Minecraft263ClientApp();
     app.start().catch((err) => {
         console.error('[Bootstrap] Fatal startup error:', err);
-        const label = document.getElementById('loading-status');
-        if (label) label.textContent = `Startup Error: ${(err         ).message}`;
     });
 });
 

@@ -20,10 +20,19 @@ export enum SoundSource {
     VOICE = 'voice',
 }
 
+export interface AudioSubtitleEntry {
+    text: string;
+    x: number;
+    y: number;
+    z: number;
+    expiresAtMs: number;
+}
+
 export class OpenALAudioEngine {
     private ctx: AudioContext | null = null;
     private masterGain: GainNode | null = null;
     private categoryGains: Map<SoundSource, GainNode> = new Map();
+    public readonly categoryVolumes: Map<SoundSource, number> = new Map();
     private bufferCache: Map<string, AudioBuffer> = new Map();
     private loadingPromises: Map<string, Promise<AudioBuffer | null>> = new Map();
     private soundEvents: Record<string, string[]> = {};
@@ -33,6 +42,16 @@ export class OpenALAudioEngine {
     private listenerVx = 0;
     private listenerVy = 0;
     private listenerVz = 0;
+    public directionalAudio = true;
+    public showSubtitles = false;
+    public readonly activeSubtitles: AudioSubtitleEntry[] = [];
+    private menuMusicSource: AudioBufferSourceNode | null = null;
+
+    constructor() {
+        for (const cat of Object.values(SoundSource)) {
+            this.categoryVolumes.set(cat, 1.0);
+        }
+    }
 
     public setSoundEventsRegistry(events: Record<string, string[]>): void {
         this.soundEvents = events;
@@ -49,12 +68,12 @@ export class OpenALAudioEngine {
         if (!AudioCtx) return null;
         this.ctx = new AudioCtx();
         this.masterGain = this.ctx.createGain();
-        this.masterGain.gain.value = 0.85;
+        this.masterGain.gain.value = this.categoryVolumes.get(SoundSource.MASTER) ?? 1.0;
         this.masterGain.connect(this.ctx.destination);
 
         for (const cat of Object.values(SoundSource)) {
             const g = this.ctx.createGain();
-            g.gain.value = 1.0;
+            g.gain.value = this.categoryVolumes.get(cat) ?? 1.0;
             g.connect(this.masterGain);
             this.categoryGains.set(cat, g);
         }
@@ -62,12 +81,42 @@ export class OpenALAudioEngine {
     }
 
     public setCategoryVolume(source: SoundSource, volume: number): void {
+        const clamped = Math.max(0, Math.min(1, volume));
+        this.categoryVolumes.set(source, clamped);
         if (source === SoundSource.MASTER && this.masterGain) {
-            this.masterGain.gain.value = Math.max(0, Math.min(1, volume));
+            this.masterGain.gain.value = clamped;
             return;
         }
         const g = this.categoryGains.get(source);
-        if (g) g.gain.value = Math.max(0, Math.min(1, volume));
+        if (g) g.gain.value = clamped;
+    }
+
+    public getCategoryVolume(source: SoundSource): number {
+        return this.categoryVolumes.get(source) ?? 1.0;
+    }
+
+    public async startMenuMusic(): Promise<void> {
+        if (this.menuMusicSource) return;
+        const ctx = this.ensureContext();
+        if (!ctx) return;
+        const buf = await this.loadOggBuffer('music_menu_mutation');
+        if (!buf || this.menuMusicSource) return;
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.loop = true;
+        const catGain = this.categoryGains.get(SoundSource.MUSIC) || this.masterGain!;
+        src.connect(catGain);
+        src.start(0);
+        this.menuMusicSource = src;
+    }
+
+    public stopMenuMusic(): void {
+        if (this.menuMusicSource) {
+            try {
+                this.menuMusicSource.stop();
+            } catch {}
+            this.menuMusicSource = null;
+        }
     }
 
     /**
@@ -164,8 +213,29 @@ export class OpenALAudioEngine {
         if (!ctx) return;
 
         const cleanEvent = eventId.replace('minecraft:', '');
+        if (this.showSubtitles) {
+            const subLabel = cleanEvent.includes('click')
+                ? 'Button clicks'
+                : cleanEvent.includes('break')
+                    ? 'Block broken'
+                    : cleanEvent.includes('place')
+                        ? 'Block placed'
+                        : cleanEvent.includes('step')
+                            ? 'Footsteps'
+                            : cleanEvent.includes('attack')
+                                ? 'Player attacks'
+                                : cleanEvent.replace(/\./g, ' ');
+            const existing = this.activeSubtitles.find(s => s.text === subLabel);
+            if (existing) {
+                existing.x = x; existing.y = y; existing.z = z;
+                existing.expiresAtMs = performance.now() + 3000;
+            } else {
+                this.activeSubtitles.push({ text: subLabel, x, y, z, expiresAtMs: performance.now() + 3000 });
+                if (this.activeSubtitles.length > 6) this.activeSubtitles.shift();
+            }
+        }
         const candidates = this.soundEvents[cleanEvent];
-        let chosenPath = cleanEvent.replace(/\./g, '/');
+        let chosenPath = cleanEvent === 'ui.button.click' ? 'random_click' : cleanEvent.replace(/\./g, '/');
         if (candidates && candidates.length > 0) {
             chosenPath = candidates[Math.floor(Math.random() * candidates.length)];
         }
@@ -202,7 +272,7 @@ export class OpenALAudioEngine {
         const catGain = this.categoryGains.get(source) || this.masterGain!;
         if (spatial) {
             const panner = ctx.createPanner();
-            panner.panningModel = 'HRTF';
+            panner.panningModel = this.directionalAudio ? 'HRTF' : 'equalpower';
             panner.distanceModel = 'linear';
             panner.refDistance = 1.0;
             panner.maxDistance = Math.max(16.0, 16.0 * volume);

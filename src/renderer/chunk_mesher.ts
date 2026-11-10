@@ -139,6 +139,9 @@ export class ChunkMesher {
     private world: ClientWorld;
     private blockUvs: Record<string, AtlasUVEntry>;
     private defaultUv: AtlasUVEntry;
+    public smoothLighting: 'off' | 'minimum' | 'maximum' = 'maximum';
+    public biomeBlendRadius = 2;
+    public graphicsMode: 'fast' | 'fancy' | 'fabulous' = 'fancy';
 
     constructor(world: ClientWorld, blockUvs: Record<string, AtlasUVEntry>) {
         this.world = world;
@@ -166,12 +169,14 @@ export class ChunkMesher {
         s1x: number, s1y: number, s1z: number,
         s2x: number, s2y: number, s2z: number
     ): number {
+        if (this.smoothLighting === 'off') return 1.0;
         const side1 = this.isOccludingAt(wx + s1x, wy + s1y, wz + s1z) ? 1 : 0;
         const side2 = this.isOccludingAt(wx + s2x, wy + s2y, wz + s2z) ? 1 : 0;
-        if (side1 && side2) return 0.48;
+        const weight = this.smoothLighting === 'minimum' ? 0.09 : 0.16;
+        if (side1 && side2) return 1.0 - 3 * weight;
         const corner = this.isOccludingAt(wx + s1x + s2x, wy + s1y + s2y, wz + s1z + s2z) ? 1 : 0;
         const occluded = side1 + side2 + corner;
-        return 1.0 - occluded * 0.16;
+        return 1.0 - occluded * weight;
     }
 
     private getBiomeTintRGBA(col: ChunkColumn, lx: number, lz: number, block: BlockRegistryEntry, face: 'up' | 'side' | 'other'): number {

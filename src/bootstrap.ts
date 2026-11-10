@@ -2,29 +2,36 @@
  * Minecraft 26.3 (`protocol_version: 777`, `world_version: 5023`) Browser Client Bootstrap
  *
  * Orchestrates:
- * 1. Asset & Registry loading (`registries.json`, `worldgen.json`, `shaders.json`, `blocks.png`,
- *    `items.png`, `ascii.png`, `.nbt` structures, `mc26_3_core.wasm`, and `epoxy.wasm`).
- * 2. Dual WebGPU (Primary) / WebGL2 (Fallback) Rendering Engine across all 8 render passes.
- * 3. Fixed 20 TPS (50ms) Client Tick Loop decoupled from variable `requestAnimationFrame` delta-time
- *    via partial tick $\Delta t \in [0, 1]$ interpolation.
- * 4. Pointer Lock API mouse look, WASD movement, Space jump, Double-Space creative flight, Shift sneak,
- *    Ctrl sprint, Left-click block break / entity attack, Right-click block placement / Chest interaction,
- *    Middle-click pick-block, Scroll / 1–9 hotbar selection, `E` Full Creative Registry Browser (all 1,288
- *    blocks & 1,253 items with live search), `F3` Debug Overlay, and `M` Wispcraft Multiplayer & Microsoft OAuth2 modal.
+ * 1. Authentic Boot Sequence: `Main.main()` -> `SplashOverlay` (`LoadingOverlay`) -> `TitleScreen`
+ *    with 6-face rotating Panorama cubemap (`panorama_0.png`..`panorama_5.png`), `minecraft.png` logo,
+ *    and bouncing yellow splash text from `splashes.txt`.
+ * 2. JVM Classfile v69.0 Bytecode Transpilation Engine (`bytecode_gui.json`) & Platform Abstraction
+ *    Layer (`PlatformAbstractionLayer`) with persistent `options.txt`, 143-language `I18n`,
+ *    IndexedDB/OPFS Singleplayer World Management, and `.zip` Resource Pack loader.
+ * 3. Full Vanilla Screen Hierarchy (`VanillaScreenManager`): `TitleScreen`, `SelectWorldScreen`,
+ *    `CreateWorldScreen` (`Game`, `World`, `More` tabs), `CreateFlatWorldScreen`, `PresetFlatWorldScreen`,
+ *    `CreateBuffetWorldScreen`, `WorldCreationGameRulesScreen`, `ExperimentsScreen`, `OptionsScreen`,
+ *    `VideoSettingsScreen`, `SoundOptionsScreen`, `ControlsScreen`, `MouseSettingsScreen`, `KeyBindsScreen`,
+ *    `LanguageSelectScreen`, `PackSelectionScreen`, `SkinCustomizationScreen`, `ChatOptionsScreen`,
+ *    `AccessibilityOptionsScreen`, `PauseScreen`, `AdvancementsScreen`, `StatsScreen`, `ShareToLanScreen`,
+ *    and `CreativeModeInventoryScreen`.
+ * 4. Dual WebGPU (Primary) / WebGL2 (Fallback) Rendering Engine & Fixed 20 TPS (50ms) Client Tick Loop.
  */
 
 import { JvmWasmCore } from './wasm/jvm_core';
 import { ChunkPos } from './runtime/long_math';
-import { BrowserVFS, parseStructureTemplateNbt } from './runtime/vfs_nbt';
+import { BrowserVFS, StructureTemplateData, parseStructureTemplateNbt } from './runtime/vfs_nbt';
 import { OpenALAudioEngine, SoundSource } from './runtime/openal_audio';
 import { ThreadedWorkerPool } from './runtime/worker_pool';
+import { PlatformAbstractionLayer, SavedWorldSummary } from './runtime/pal';
 import { WispEpoxyClient } from './network/wisp_epoxy';
 import { MicrosoftAuthenticator, MinecraftProfile } from './network/microsoft_auth';
 import { MinecraftProtocol263Client } from './network/protocol_26_3';
 import { WorldgenDataJson, WorldgenNoiseRouter } from './world/noise_router';
 import { AABB, BiomeRegistryEntry, BlockRegistryEntry, ClientWorld } from './world/physics_tick';
 import { AtlasUVEntry, ChunkMesher } from './renderer/chunk_mesher';
-import { ActiveGraphicsBackend, DualRenderEngine } from './renderer/render_engine';
+import { DualRenderEngine } from './renderer/render_engine';
+import { VanillaScreenManager } from './gui/vanilla_screens';
 
 interface RegistriesBundle {
     version: string;
@@ -51,19 +58,50 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     });
 }
 
+function parseWorldSeedBigInt(seedStr: string): bigint {
+    const trimmed = seedStr.trim();
+    if (!trimmed) {
+        return BigInt(Math.floor(Math.random() * 0x7fffffff));
+    }
+    if (/^-?\d+$/.test(trimmed)) {
+        try {
+            return BigInt(trimmed);
+        } catch {}
+    }
+    let h = 0xcbf29ce484222325n;
+    for (let i = 0; i < trimmed.length; i++) {
+        h ^= BigInt(trimmed.charCodeAt(i));
+        h = BigInt.asUintN(64, h * 0x100000001b3n);
+    }
+    return BigInt.asIntN(64, h);
+}
+
 export class Minecraft263ClientApp {
     private registries!: RegistriesBundle;
     private worldgenData!: WorldgenDataJson;
+    private defaultStructureTemplate: StructureTemplateData | null = null;
+    private blocksImg!: HTMLImageElement;
+    private itemsImg!: HTMLImageElement;
+    private asciiImg!: HTMLImageElement;
+
     private world!: ClientWorld;
     private mesher!: ChunkMesher;
     private renderer!: DualRenderEngine;
     private audio = new OpenALAudioEngine();
     private vfs = new BrowserVFS();
     private workerPool = new ThreadedWorkerPool();
+    private pal!: PlatformAbstractionLayer;
+    private gui!: VanillaScreenManager;
+
     private wisp = WispEpoxyClient.getOrCreate('wss://anura.pro/');
     private msaAuth = new MicrosoftAuthenticator(this.wisp);
     private netClient: MinecraftProtocol263Client | null = null;
     private profile: MinecraftProfile = MicrosoftAuthenticator.createOfflineProfile('Player26_3');
+
+    // Active Singleplayer World State
+    private inWorld = false;
+    private currentWorldSummary: SavedWorldSummary | null = null;
+    private modifiedBlocksMap: Map<string, number> = new Map();
 
     // Player Physics State (20 TPS + partialTick interpolation)
     private px = 8.5;
@@ -84,37 +122,81 @@ export class Minecraft263ClientApp {
     private isSwinging = false;
     private stepDistanceAccum = 0;
 
-    // Input & UI State
+    // Input & HUD State
     private keysDown: Set<string> = new Set();
     private selectedHotbarSlot = 0;
     private hotbarBlocks: BlockRegistryEntry[] = [];
-    private showF3Debug = true;
-    private isInventoryOpen = false;
-    private isMultiplayerOpen = false;
-    private renderDistanceChunks = 4;
+    private showF3Debug = false;
+    private hideGuiF1 = false;
+    private sneakLatched = false;
+    private sprintLatched = false;
+
+    // Player Statistics (`StatsScreen`)
+    private playerStats: Record<string, number> = {
+        blocks_mined: 0,
+        blocks_placed: 0,
+        jumps: 0,
+        distance_walked_cm: 0,
+        ticks_played: 0,
+        mobs_hit: 0,
+    };
 
     // Loop Telemetry
     private fps = 60;
     private frameCounter = 0;
     private lastFpsUpdateMs = performance.now();
     private lastFrameTimeMs = performance.now();
+    private lastRenderedFrameMs = 0;
     private tickAccumulatorMs = 0;
 
     public async start(): Promise<void> {
-        const setProgress = (pct: number, text: string) => {
-            const bar = document.getElementById('loading-bar-fill');
-            const label = document.getElementById('loading-status');
-            if (bar) bar.style.width = `${pct}%`;
-            if (label) label.textContent = text;
-        };
+        this.pal = new PlatformAbstractionLayer(this.vfs, this.audio);
 
-        setProgress(10, 'Initializing JVM-to-WASM Core (mc26_3_core.wasm) & Epoxy Wisp...');
+        const guiRoot = document.getElementById('vanilla-gui-root') as HTMLElement;
+        const bgCanvas = document.getElementById('gui-bg-canvas') as HTMLCanvasElement;
+        this.gui = new VanillaScreenManager(
+            this.pal,
+            {
+                onStartWorld: (cfg) => this.startSingleplayerWorld(cfg),
+                onSaveAndQuitToTitle: () => this.saveAndQuitToTitle(),
+                onVideoOptionsChanged: (backendSwitch) => this.applyOptionsToEngine(backendSwitch),
+                onSelectHotbarBlock: (slot, block) => {
+                    this.hotbarBlocks[slot] = block;
+                },
+                getHotbarBlocks: () => this.hotbarBlocks,
+                getSelectedHotbarSlot: () => this.selectedHotbarSlot,
+                getBlockUvs: () => this.registries?.atlases.blocks.uvs || {},
+                getAllBlocks: () => this.registries?.blocks || [],
+                getAllBiomes: () => this.registries?.biomes || [],
+                getPlayerStats: () => this.playerStats,
+                onPingMultiplayer: (wispUrl, serverAddr, setLog) => this.pingMultiplayer(wispUrl, serverAddr, setLog),
+                onConnectMultiplayer: (wispUrl, serverAddr, username, setLog) =>
+                    this.connectMultiplayer(wispUrl, serverAddr, username, setLog),
+                onMsaLogin: (wispUrl, setLog, onName) => this.loginMicrosoft(wispUrl, setLog, onName),
+            },
+            guiRoot,
+            bgCanvas
+        );
+
+        // Start animation loop immediately so `SplashOverlay` (`LoadingOverlay`) renders Mojang Red bar & logo
+        requestAnimationFrame((t) => this.frameLoop(t));
+
+        this.gui.setSplashProgress(10, 'Initializing JVM-to-WASM Core (mc26_3_core.wasm) & Epoxy Wisp...');
         await JvmWasmCore.init('assets/mc26_3_core.wasm');
         await this.wisp.initEpoxyWasm('assets/epoxy.wasm');
         await this.vfs.init();
         this.workerPool.initInlineWorkers();
 
-        setProgress(28, 'Loading Minecraft 26.3 Registries (1,288 Blocks, 1,253 Items, 162 Entities, 67 Biomes)...');
+        this.gui.setSplashProgress(26, 'Loading JVM Classfile v69.0 Bytecode (bytecode_gui.json) & I18n...');
+        let enUsDict: Record<string, string> = {};
+        try {
+            const enResp = await fetch('assets/lang/en_us.json');
+            if (enResp.ok) enUsDict = await enResp.json();
+        } catch {}
+        await this.pal.init('assets/bytecode_gui.json', enUsDict);
+        await this.gui.loadGuiTextures();
+
+        this.gui.setSplashProgress(48, 'Loading Minecraft 26.3 Registries (1,288 Blocks, 1,253 Items, 67 Biomes)...');
         const [regResp, wgResp] = await Promise.all([
             fetch('assets/registries.json'),
             fetch('assets/worldgen.json'),
@@ -123,36 +205,42 @@ export class Minecraft263ClientApp {
         this.worldgenData = await wgResp.json();
         this.audio.setSoundEventsRegistry(this.registries.soundEvents);
 
-        setProgress(52, 'Loading Stitched Texture Atlases (blocks.png, items.png, ascii.png)...');
+        this.gui.setSplashProgress(70, 'Loading Stitched Texture Atlases (blocks.png, items.png, ascii.png)...');
         const [blocksImg, itemsImg, asciiImg] = await Promise.all([
             loadImage('assets/blocks.png'),
             loadImage('assets/items.png'),
             loadImage('assets/ascii.png'),
         ]);
+        this.blocksImg = blocksImg;
+        this.itemsImg = itemsImg;
+        this.asciiImg = asciiImg;
 
-        setProgress(70, 'Initializing Dual WebGPU / WebGL2 Rendering Pipeline...');
+        this.gui.setSplashProgress(86, 'Initializing Dual WebGPU / WebGL2 Rendering Pipeline...');
         const canvas3D = document.getElementById('game-canvas-3d') as HTMLCanvasElement;
         const canvasGui = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
         this.renderer = new DualRenderEngine(canvas3D, canvasGui);
         this.renderer.resize(window.innerWidth, window.innerHeight);
-        await this.renderer.init(blocksImg, itemsImg, asciiImg);
+        await this.renderer.init(
+            blocksImg,
+            itemsImg,
+            asciiImg,
+            this.pal.options.preferredGraphicsBackend
+        );
 
-        setProgress(82, 'Constructing Worldgen NoiseRouter, Splines, and Structure Templates (.nbt)...');
-        const noiseRouter = new WorldgenNoiseRouter(2632026n, this.worldgenData);
-        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, noiseRouter);
-        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
-
-        // Load sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
+        // Preload sample .nbt structure template (Minecraft 26.3 Dappled Forest Abandoned Camp)
         try {
             const nbtResp = await fetch('assets/structures/abandoned_camp__camp__dappled_forest__campsite_dappled_forest_1.nbt');
             if (nbtResp.ok) {
                 const nbtBytes = new Uint8Array(await nbtResp.arrayBuffer());
-                const tmpl = await parseStructureTemplateNbt(nbtBytes);
-                this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', tmpl);
+                this.defaultStructureTemplate = await parseStructureTemplateNbt(nbtBytes);
             }
         } catch {}
 
-        // Populate initial 9-slot hotbar featuring iconic & new Minecraft 26.3 blocks
+        // Construct initial idle ClientWorld for background / hotbar reference before user selects a world
+        const initialRouter = new WorldgenNoiseRouter(2632026n, this.worldgenData);
+        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, initialRouter);
+        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
+
         const pickBlock = (name: string) =>
             this.world.blockByName.get(name) || this.registries.blocks[1];
         this.hotbarBlocks = [
@@ -167,120 +255,21 @@ export class Minecraft263ClientApp {
             pickBlock('glowstone'),
         ];
 
-        setProgress(92, 'Generating Initial Spawn Chunks & Meshing Compact 32-Byte Vertices...');
-        for (let cx = -2; cx <= 2; cx++) {
-            for (let cz = -2; cz <= 2; cz++) {
-                const col = this.world.getOrCreateChunk(cx, cz);
-                const mesh = this.mesher.buildChunkMesh(col);
-                this.renderer.uploadChunkMesh(mesh);
-            }
-        }
+        await this.applyOptionsToEngine(false);
+        this.bindGlobalControls();
 
-        // Spawn a 26.3 Sulfur Cube right in front of the player so it's immediately visible!
-        const spawnChunk = this.world.getOrCreateChunk(0, 0);
-        const spawnSurfY = spawnChunk.heightmap[(8 << 4) | 8];
-        this.px = 8.5;
-        this.py = spawnSurfY + 2.0;
-        this.pz = 8.5;
-        this.prevPx = this.px;
-        this.prevPy = this.py;
-        this.prevPz = this.pz;
-        this.world.spawnMob('sulfur_cube', this.px + 2.5, spawnSurfY + 2.0, this.pz - 4.5);
-        this.world.spawnMob('pig', this.px - 3.5, spawnSurfY + 2.0, this.pz - 5.0);
-
-        setProgress(100, 'Ready!');
-        setTimeout(() => {
-            const loadingScreen = document.getElementById('loading-overlay');
-            if (loadingScreen) loadingScreen.style.display = 'none';
-        }, 200);
-
-        this.bindControlsAndModals();
-        requestAnimationFrame((t) => this.frameLoop(t));
+        // Complete `SplashOverlay` -> fades out into `TitleScreen` (never skips TitleScreen!)
+        this.gui.openScreen('title', false);
+        this.gui.setSplashProgress(100, 'Ready — Transitioning to TitleScreen...');
     }
 
-    private bindControlsAndModals(): void {
-        const canvasGui = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
+    private async applyOptionsToEngine(backendSwitchRequested?: boolean): Promise<void> {
+        const opts = this.pal.options;
+        this.pal.syncAudioOptions();
 
-        window.addEventListener('resize', () => {
-            this.renderer.resize(window.innerWidth, window.innerHeight);
-        });
+        if (!this.renderer || !this.mesher) return;
 
-        // Pointer Lock on canvas click
-        canvasGui.addEventListener('mousedown', (e) => {
-            if (this.isInventoryOpen || this.isMultiplayerOpen) return;
-            this.audio.ensureContext();
-            if (document.pointerLockElement !== canvasGui) {
-                canvasGui.requestPointerLock();
-                return;
-            }
-            this.handleMouseAction(e.button);
-        });
-
-        window.addEventListener('contextmenu', (e) => e.preventDefault());
-
-        document.addEventListener('mousemove', (e) => {
-            if (document.pointerLockElement !== canvasGui) return;
-            const sensitivity = 0.0022;
-            this.yawRad -= e.movementX * sensitivity;
-            this.pitchRad = Math.max(-Math.PI * 0.495, Math.min(Math.PI * 0.495, this.pitchRad - e.movementY * sensitivity));
-        });
-
-        window.addEventListener('wheel', (e) => {
-            if (this.isInventoryOpen || this.isMultiplayerOpen) return;
-            if (e.deltaY > 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 1) % 9;
-            else if (e.deltaY < 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 8) % 9;
-        });
-
-        window.addEventListener('keydown', (e) => {
-            if (this.isMultiplayerOpen && document.activeElement?.tagName === 'INPUT') {
-                if (e.code === 'Escape') this.toggleMultiplayerModal(false);
-                return;
-            }
-            if (this.isInventoryOpen && document.activeElement?.tagName === 'INPUT') {
-                if (e.code === 'Escape') this.toggleInventoryModal(false);
-                return;
-            }
-
-            if (e.code === 'F3') {
-                e.preventDefault();
-                this.showF3Debug = !this.showF3Debug;
-                return;
-            }
-            if (e.code === 'KeyE') {
-                e.preventDefault();
-                this.toggleInventoryModal(!this.isInventoryOpen);
-                return;
-            }
-            if (e.code === 'KeyM') {
-                e.preventDefault();
-                this.toggleMultiplayerModal(!this.isMultiplayerOpen);
-                return;
-            }
-            if (e.code.startsWith('Digit')) {
-                const num = parseInt(e.code.slice(5), 10);
-                if (num >= 1 && num <= 9) {
-                    this.selectedHotbarSlot = num - 1;
-                }
-            }
-            if (e.code === 'Space' && !this.keysDown.has('Space')) {
-                const now = performance.now();
-                if (now - this.lastSpaceTapMs < 280) {
-                    this.isFlying = !this.isFlying;
-                    this.vy = 0;
-                }
-                this.lastSpaceTapMs = now;
-            }
-            this.keysDown.add(e.code);
-        });
-
-        window.addEventListener('keyup', (e) => {
-            this.keysDown.delete(e.code);
-        });
-
-        // Bind Top Toolbar Buttons (Backend Toggle, Creative Inventory, Wispcraft Multiplayer)
-        document.getElementById('btn-toggle-backend')?.addEventListener('click', async () => {
-            const nextBackend: ActiveGraphicsBackend = this.renderer.backend === 'WebGPU' ? 'WebGL2' : 'WebGPU';
-            // Recreate 3D canvas because a canvas bound to WebGPU cannot acquire a WebGL2 context and vice-versa
+        if (backendSwitchRequested && this.renderer.backend !== opts.preferredGraphicsBackend) {
             const oldCanvas = document.getElementById('game-canvas-3d')!;
             const newCanvas = document.createElement('canvas');
             newCanvas.id = 'game-canvas-3d';
@@ -290,171 +279,381 @@ export class Minecraft263ClientApp {
 
             const guiCanvas = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
             this.renderer = new DualRenderEngine(newCanvas, guiCanvas);
-            await this.renderer.init(
-                await loadImage('assets/blocks.png'),
-                await loadImage('assets/items.png'),
-                await loadImage('assets/ascii.png'),
-                nextBackend
-            );
-            // Re-upload active chunks
+            await this.renderer.init(this.blocksImg, this.itemsImg, this.asciiImg, opts.preferredGraphicsBackend);
+        }
+
+        const prevSmooth = this.mesher.smoothLighting;
+        this.mesher.smoothLighting = opts.smoothLighting;
+        this.renderer.gamma = opts.gamma;
+        this.renderer.cloudMode = opts.renderClouds;
+        this.renderer.cloudHeight = opts.cloudRange;
+        this.renderer.particlesMode = opts.particles;
+        this.renderer.entityShadows = opts.entityShadows;
+        this.renderer.entityDistanceScaling = opts.entityDistanceScaling;
+        this.renderer.guiScale = opts.guiScale;
+        this.renderer.mainHand = opts.mainHand;
+        this.renderer.attackIndicator = opts.attackIndicator;
+        this.renderer.activeSubtitles = this.audio.activeSubtitles;
+
+        if (this.inWorld && (prevSmooth !== opts.smoothLighting || backendSwitchRequested)) {
+            this.renderer.clearChunkMeshes();
             for (const col of this.world.chunks.values()) {
                 this.renderer.uploadChunkMesh(this.mesher.buildChunkMesh(col));
             }
-            const btn = document.getElementById('btn-toggle-backend');
-            if (btn) btn.textContent = `Backend: ${this.renderer.backend}`;
-        });
-
-        document.getElementById('btn-open-inventory')?.addEventListener('click', () => {
-            this.toggleInventoryModal(!this.isInventoryOpen);
-        });
-
-        document.getElementById('btn-open-multiplayer')?.addEventListener('click', () => {
-            this.toggleMultiplayerModal(!this.isMultiplayerOpen);
-        });
-
-        this.setupInventoryBrowserUI();
-        this.setupMultiplayerModalUI();
+        }
     }
 
-    private setupInventoryBrowserUI(): void {
-        const searchInput = document.getElementById('inv-search-input') as HTMLInputElement | null;
-        const grid = document.getElementById('inv-grid');
-        const closeBtn = document.getElementById('btn-close-inventory');
+    /**
+     * Launches a Singleplayer World (`SelectWorldScreen` -> Play or `CreateWorldScreen` -> Create New World).
+     */
+    private async startSingleplayerWorld(worldConfig: SavedWorldSummary): Promise<void> {
+        this.currentWorldSummary = worldConfig;
+        this.currentWorldSummary.lastPlayedMs = Date.now();
+        await this.pal.persistSavedWorlds();
 
-        closeBtn?.addEventListener('click', () => this.toggleInventoryModal(false));
+        const seedBig = parseWorldSeedBigInt(worldConfig.seed);
+        const router = new WorldgenNoiseRouter(seedBig, this.worldgenData);
+        this.world = new ClientWorld(this.registries.blocks, this.registries.biomes, router, {
+            worldType: worldConfig.worldType,
+            flatLayers: worldConfig.flatLayers,
+            flatBiome: worldConfig.flatBiome,
+            singleBiome: worldConfig.singleBiome,
+            generateStructures: worldConfig.generateStructures,
+            bonusChest: worldConfig.bonusChest,
+            gameRules: worldConfig.gameRules,
+        });
 
-        const renderGrid = (query: string) => {
-            if (!grid) return;
-            grid.innerHTML = '';
-            const q = query.trim().toLowerCase();
-            const matches = this.registries.blocks.filter(b => !b.properties.air && (!q || b.name.includes(q))).slice(0, 180);
-            for (const blk of matches) {
-                const cell = document.createElement('div');
-                cell.className = 'inv-cell';
-                cell.title = `minecraft:${blk.name} (#${blk.rawId})`;
+        if (this.defaultStructureTemplate && worldConfig.generateStructures) {
+            this.world.structures.set('abandoned_camp/campsite_dappled_forest_1', this.defaultStructureTemplate);
+        }
 
-                const icon = document.createElement('div');
-                icon.className = 'inv-icon';
-                const uv = this.registries.atlases.blocks.uvs[blk.textures.north] || this.registries.atlases.blocks.uvs[blk.textures.up];
-                if (uv) {
-                    icon.style.backgroundImage = 'url(assets/blocks.png)';
-                    icon.style.backgroundPosition = `-${uv.x * 2}px -${uv.y * 2}px`;
-                    icon.style.backgroundSize = `${this.registries.atlases.blocks.width * 2}px ${this.registries.atlases.blocks.height * 2}px`;
+        this.mesher = new ChunkMesher(this.world, this.registries.atlases.blocks.uvs);
+        this.mesher.smoothLighting = this.pal.options.smoothLighting;
+        this.renderer.clearChunkMeshes();
+
+        // Generate initial 5x5 chunk grid around (0, 0)
+        for (let cx = -2; cx <= 2; cx++) {
+            for (let cz = -2; cz <= 2; cz++) {
+                this.world.getOrCreateChunk(cx, cz);
+            }
+        }
+
+        // Apply saved block diffs if reopening an existing world
+        this.modifiedBlocksMap.clear();
+        if (worldConfig.blockDiffs) {
+            for (const [bx, by, bz, blockId] of worldConfig.blockDiffs) {
+                this.world.setBlockId(bx, by, bz, blockId, false);
+                this.modifiedBlocksMap.set(`${bx},${by},${bz}`, blockId);
+            }
+        }
+
+        const spawnChunk = this.world.getOrCreateChunk(0, 0);
+        const spawnSurfY = spawnChunk.heightmap[(8 << 4) | 8];
+
+        // Bonus chest placement on first load if requested
+        if (worldConfig.bonusChest && !worldConfig.playerState) {
+            const chestBlock = this.world.blockByName.get('chest');
+            const torchBlock = this.world.blockByName.get('torch');
+            if (chestBlock) {
+                this.world.setBlockId(8, spawnSurfY + 1, 6, chestBlock.rawId, false);
+                if (torchBlock) {
+                    this.world.setBlockId(7, spawnSurfY + 1, 6, torchBlock.rawId, false);
+                    this.world.setBlockId(9, spawnSurfY + 1, 6, torchBlock.rawId, false);
                 }
-
-                const lbl = document.createElement('span');
-                lbl.textContent = blk.name.replace(/_/g, ' ');
-                cell.appendChild(icon);
-                cell.appendChild(lbl);
-
-                cell.addEventListener('click', () => {
-                    this.hotbarBlocks[this.selectedHotbarSlot] = blk;
-                    this.audio.playSoundEvent('ui.button.click', SoundSource.MASTER, 0, 0, 0, 0.7, 1.0, false);
-                    this.toggleInventoryModal(false);
-                });
-                grid.appendChild(cell);
             }
-        };
+        }
 
-        searchInput?.addEventListener('input', () => renderGrid(searchInput.value));
-        renderGrid('');
+        // Upload chunk meshes to GPU
+        for (const col of this.world.chunks.values()) {
+            const mesh = this.mesher.buildChunkMesh(col);
+            this.renderer.uploadChunkMesh(mesh);
+        }
+
+        if (worldConfig.playerState) {
+            this.px = worldConfig.playerState.x;
+            this.py = worldConfig.playerState.y;
+            this.pz = worldConfig.playerState.z;
+            this.yawRad = worldConfig.playerState.yawRad;
+            this.pitchRad = worldConfig.playerState.pitchRad;
+        } else {
+            this.px = 8.5;
+            this.py = spawnSurfY + 2.0;
+            this.pz = 8.5;
+            this.yawRad = 0;
+            this.pitchRad = 0;
+        }
+        this.prevPx = this.px;
+        this.prevPy = this.py;
+        this.prevPz = this.pz;
+        this.vx = 0;
+        this.vy = 0;
+        this.vz = 0;
+        this.isFlying = false;
+
+        // Spawn ambient mobs if do_mob_spawning is enabled
+        if (this.world.gameRules.do_mob_spawning !== false && worldConfig.worldType !== 'debug_all_block_states') {
+            this.world.spawnMob('sulfur_cube', this.px + 2.5, spawnSurfY + 2.0, this.pz - 4.5);
+            this.world.spawnMob('pig', this.px - 3.5, spawnSurfY + 2.0, this.pz - 5.0);
+        }
+
+        this.inWorld = true;
+        this.gui.inWorld = true;
+        this.audio.stopMenuMusic();
+
+        const canvasGui = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
+        try {
+            canvasGui.requestPointerLock();
+        } catch {}
     }
 
-    private setupMultiplayerModalUI(): void {
-        const closeBtn = document.getElementById('btn-close-multiplayer');
-        const wispInput = document.getElementById('mp-wisp-url') as HTMLInputElement | null;
-        const serverInput = document.getElementById('mp-server-addr') as HTMLInputElement | null;
-        const usernameInput = document.getElementById('mp-username') as HTMLInputElement | null;
-        const statusBox = document.getElementById('mp-status-log');
-
-        const setLog = (msg: string) => {
-            if (statusBox) statusBox.textContent = msg;
-        };
-
-        closeBtn?.addEventListener('click', () => this.toggleMultiplayerModal(false));
-
-        // Microsoft OAuth 2.0 Device Code Button
-        document.getElementById('btn-msa-login')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                setLog('Requesting Microsoft OAuth 2.0 Device Code...');
-                const dc = await this.msaAuth.requestDeviceCode();
-                setLog(`${dc.message} (Polling for authorization...)`);
-                const tokens = await this.msaAuth.pollDeviceCodeToken(dc.deviceCode, dc.interval, setLog);
-                setLog('Exchanging Microsoft Token -> Xbox Live -> XSTS -> Minecraft Services...');
-                this.profile = await this.msaAuth.authenticateMinecraftWithMsaToken(tokens.accessToken, tokens.refreshToken);
-                if (usernameInput) usernameInput.value = this.profile.name;
-                setLog(`Authenticated as ${this.profile.name} (UUID: ${this.profile.id})`);
-            } catch (err) {
-                setLog(`Microsoft OAuth Notice: ${(err as Error).message}`);
+    /**
+     * Saves the active Singleplayer world state (`playerState` & `blockDiffs`) to OPFS/IndexedDB
+     * and returns cleanly to `TitleScreen`.
+     */
+    private async saveAndQuitToTitle(): Promise<void> {
+        if (this.currentWorldSummary) {
+            const diffs: Array<[number, number, number, number]> = [];
+            for (const [k, v] of this.modifiedBlocksMap.entries()) {
+                const [bx, by, bz] = k.split(',').map(Number);
+                diffs.push([bx, by, bz, v]);
             }
-        });
+            this.currentWorldSummary.playerState = {
+                x: this.px,
+                y: this.py,
+                z: this.pz,
+                yawRad: this.yawRad,
+                pitchRad: this.pitchRad,
+            };
+            this.currentWorldSummary.blockDiffs = diffs;
+            this.currentWorldSummary.lastPlayedMs = Date.now();
+            await this.pal.persistSavedWorlds();
+        }
 
-        // Ping Server Status (Protocol 777 Status State 1)
-        document.getElementById('btn-mp-ping')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                const addr = serverInput?.value.trim() || 'localhost:25565';
-                setLog(`Pinging ${addr} via Wisp (${this.wisp.wispUrl})...`);
-                const client = new MinecraftProtocol263Client(this.wisp);
-                const status = await client.pingServerStatus(addr);
-                const motd = typeof status.description === 'string'
-                    ? status.description
-                    : status.description.text || JSON.stringify(status.description);
-                setLog(`Online! Version: ${status.version.name} (Protocol ${status.version.protocol}) | Players: ${status.players.online}/${status.players.max} | RTT: ${status.latencyMs}ms | MOTD: ${motd}`);
-            } catch (err) {
-                setLog(`Ping error: ${(err as Error).message}`);
-            }
-        });
-
-        // Connect to Server (Protocol 777 Handshake -> Login -> Configuration -> Play)
-        document.getElementById('btn-mp-connect')?.addEventListener('click', async () => {
-            try {
-                if (wispInput?.value) this.wisp.setWispServer(wispInput.value.trim());
-                if (usernameInput?.value && this.profile.offlineMode) {
-                    this.profile = MicrosoftAuthenticator.createOfflineProfile(usernameInput.value);
-                }
-                const addr = serverInput?.value.trim() || 'localhost:25565';
-                this.netClient?.disconnect();
-                this.netClient = new MinecraftProtocol263Client(this.wisp, {
-                    onStatusUpdate: setLog,
-                    onLoginSuccess: (uuid, name) => setLog(`LoginSuccess: ${name} (${uuid})`),
-                    onEnterPlayState: () => {
-                        setLog(`Connected to ${addr} in Play State (Protocol 777)!`);
-                        setTimeout(() => this.toggleMultiplayerModal(false), 600);
-                    },
-                    onDisconnect: (reason) => setLog(`Disconnected: ${reason}`),
-                    onPlayerPosition: (x, y, z, yaw, pitch) => {
-                        this.px = x; this.py = y; this.pz = z;
-                        this.yawRad = (-yaw * Math.PI) / 180;
-                        this.pitchRad = (-pitch * Math.PI) / 180;
-                    },
-                    onBlockUpdate: (x, y, z, stateId) => {
-                        this.world.setBlockId(x, y, z, stateId % this.registries.blocks.length);
-                    },
-                });
-                await this.netClient.connectToServer(addr, this.profile);
-            } catch (err) {
-                setLog(`Connect error: ${(err as Error).message}`);
-            }
-        });
-    }
-
-    private toggleInventoryModal(open: boolean): void {
-        this.isInventoryOpen = open;
-        const modal = document.getElementById('inventory-modal');
-        if (modal) modal.style.display = open ? 'flex' : 'none';
-        if (open && document.pointerLockElement) {
+        this.netClient?.disconnect();
+        this.netClient = null;
+        this.inWorld = false;
+        this.gui.inWorld = false;
+        this.renderer.clearChunkMeshes();
+        if (document.pointerLockElement) {
             document.exitPointerLock();
         }
     }
 
-    private toggleMultiplayerModal(open: boolean): void {
-        this.isMultiplayerOpen = open;
-        const modal = document.getElementById('multiplayer-modal');
-        if (modal) modal.style.display = open ? 'flex' : 'none';
-        if (open && document.pointerLockElement) {
-            document.exitPointerLock();
+    private isKeyBoundPressed(actionKey: string): boolean {
+        const boundCode = this.pal.options.getKeyCode(actionKey);
+        return boundCode ? this.keysDown.has(boundCode) : false;
+    }
+
+    private bindGlobalControls(): void {
+        const canvasGui = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
+
+        window.addEventListener('resize', () => {
+            this.renderer.resize(window.innerWidth, window.innerHeight);
+        });
+
+        canvasGui.addEventListener('mousedown', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            this.audio.ensureContext();
+            if (document.pointerLockElement !== canvasGui) {
+                canvasGui.requestPointerLock();
+                return;
+            }
+            const mouseCode = `Mouse${e.button}`;
+            if (mouseCode === this.pal.options.getKeyCode('key.attack') || e.button === 0) {
+                this.handleMouseAction(0);
+            } else if (mouseCode === this.pal.options.getKeyCode('key.use') || e.button === 2) {
+                this.handleMouseAction(2);
+            } else if (mouseCode === this.pal.options.getKeyCode('key.pickItem') || e.button === 1) {
+                this.handleMouseAction(1);
+            }
+        });
+
+        window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        document.addEventListener('mousemove', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            if (document.pointerLockElement !== canvasGui) return;
+            const sensOption = this.pal.options.mouseSensitivity;
+            const f = sensOption * 0.6 + 0.2;
+            const sens = f * f * f * 0.008;
+            const invertMult = this.pal.options.invertYMouse ? -1 : 1;
+            this.yawRad -= e.movementX * sens;
+            this.pitchRad = Math.max(
+                -Math.PI * 0.495,
+                Math.min(Math.PI * 0.495, this.pitchRad - e.movementY * sens * invertMult)
+            );
+        });
+
+        window.addEventListener('wheel', (e) => {
+            if (!this.inWorld || this.gui.activeScreen !== 'none') return;
+            if (e.deltaY > 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 1) % 9;
+            else if (e.deltaY < 0) this.selectedHotbarSlot = (this.selectedHotbarSlot + 8) % 9;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'SELECT') {
+                return;
+            }
+
+            const getKey = (id: string) => this.pal.options.getKeyCode(id);
+
+            if (e.code === getKey('key.fullscreen') || e.code === 'F11') {
+                e.preventDefault();
+                this.pal.options.fullscreen = !this.pal.options.fullscreen;
+                if (this.pal.options.fullscreen) document.documentElement.requestFullscreen?.().catch(() => {});
+                else document.exitFullscreen?.().catch(() => {});
+                this.pal.saveOptions();
+                return;
+            }
+
+            if (!this.inWorld) return;
+
+            if (e.code === getKey('key.toggleGui') || e.code === 'F1') {
+                e.preventDefault();
+                this.hideGuiF1 = !this.hideGuiF1;
+                return;
+            }
+
+            if (e.code === getKey('key.debug.overlay') || e.code === 'F3') {
+                e.preventDefault();
+                this.showF3Debug = !this.showF3Debug;
+                return;
+            }
+
+            if (e.code === getKey('key.inventory')) {
+                e.preventDefault();
+                if (this.gui.activeScreen === 'creative_inventory') {
+                    this.gui.openScreen('none', false);
+                    canvasGui.requestPointerLock();
+                } else if (this.gui.activeScreen === 'none') {
+                    this.gui.openScreen('creative_inventory', true);
+                }
+                return;
+            }
+
+            if (e.code === getKey('key.advancements')) {
+                e.preventDefault();
+                if (this.gui.activeScreen === 'advancements') {
+                    this.gui.openScreen('none', false);
+                    canvasGui.requestPointerLock();
+                } else if (this.gui.activeScreen === 'none') {
+                    this.gui.openScreen('advancements', true);
+                }
+                return;
+            }
+
+            // Hotbar 1..9
+            for (let i = 1; i <= 9; i++) {
+                if (e.code === getKey(`key.hotbar.${i}`)) {
+                    this.selectedHotbarSlot = i - 1;
+                }
+            }
+
+            // Toggle vs Hold Sneak / Sprint
+            if (e.code === getKey('key.sneak') && !this.keysDown.has(e.code) && this.pal.options.toggleCrouch) {
+                this.sneakLatched = !this.sneakLatched;
+            }
+            if (e.code === getKey('key.sprint') && !this.keysDown.has(e.code) && this.pal.options.toggleSprint) {
+                this.sprintLatched = !this.sprintLatched;
+            }
+
+            // Double-tap Jump for Creative/Commands flight
+            if (e.code === getKey('key.jump') && !this.keysDown.has(e.code)) {
+                const now = performance.now();
+                const canFly =
+                    !this.currentWorldSummary ||
+                    this.currentWorldSummary.gameMode === 'creative' ||
+                    this.currentWorldSummary.allowCommands;
+                if (canFly && now - this.lastSpaceTapMs < 280) {
+                    this.isFlying = !this.isFlying;
+                    this.vy = 0;
+                }
+                this.lastSpaceTapMs = now;
+            }
+
+            this.keysDown.add(e.code);
+        });
+
+        window.addEventListener('keyup', (e) => {
+            this.keysDown.delete(e.code);
+        });
+    }
+
+    private async pingMultiplayer(wispUrl: string, serverAddr: string, setLog: (msg: string) => void): Promise<void> {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            setLog(`Pinging ${serverAddr} via Wisp (${this.wisp.wispUrl})...`);
+            const client = new MinecraftProtocol263Client(this.wisp);
+            const status = await client.pingServerStatus(serverAddr);
+            const motd =
+                typeof status.description === 'string'
+                    ? status.description
+                    : status.description.text || JSON.stringify(status.description);
+            setLog(
+                `Online! Version: ${status.version.name} (Protocol ${status.version.protocol}) | Players: ${status.players.online}/${status.players.max} | RTT: ${status.latencyMs}ms | MOTD: ${motd}`
+            );
+        } catch (err) {
+            setLog(`Ping error: ${(err as Error).message}`);
+        }
+    }
+
+    private async connectMultiplayer(
+        wispUrl: string,
+        serverAddr: string,
+        username: string,
+        setLog: (msg: string) => void
+    ): Promise<void> {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            if (username && this.profile.offlineMode) {
+                this.profile = MicrosoftAuthenticator.createOfflineProfile(username);
+            }
+            this.netClient?.disconnect();
+            this.netClient = new MinecraftProtocol263Client(this.wisp, {
+                onStatusUpdate: setLog,
+                onLoginSuccess: (uuid, name) => setLog(`LoginSuccess: ${name} (${uuid})`),
+                onEnterPlayState: async () => {
+                    setLog(`Connected to ${serverAddr} in Play State (Protocol 777)!`);
+                    if (!this.inWorld && this.pal.savedWorlds.length > 0) {
+                        await this.startSingleplayerWorld(this.pal.savedWorlds[0]);
+                    }
+                    this.gui.openScreen('none', false);
+                },
+                onDisconnect: (reason) => setLog(`Disconnected: ${reason}`),
+                onPlayerPosition: (x, y, z, yaw, pitch) => {
+                    this.px = x;
+                    this.py = y;
+                    this.pz = z;
+                    this.yawRad = (-yaw * Math.PI) / 180;
+                    this.pitchRad = (-pitch * Math.PI) / 180;
+                },
+                onBlockUpdate: (x, y, z, stateId) => {
+                    this.world.setBlockId(x, y, z, stateId % this.registries.blocks.length);
+                },
+            });
+            await this.netClient.connectToServer(serverAddr, this.profile);
+        } catch (err) {
+            setLog(`Connect error: ${(err as Error).message}`);
+        }
+    }
+
+    private async loginMicrosoft(
+        wispUrl: string,
+        setLog: (msg: string) => void,
+        onName: (name: string) => void
+    ): Promise<void> {
+        try {
+            if (wispUrl) this.wisp.setWispServer(wispUrl);
+            setLog('Requesting Microsoft OAuth 2.0 Device Code...');
+            const dc = await this.msaAuth.requestDeviceCode();
+            setLog(`${dc.message} (Polling for authorization...)`);
+            const tokens = await this.msaAuth.pollDeviceCodeToken(dc.deviceCode, dc.interval, setLog);
+            setLog('Exchanging Microsoft Token -> Xbox Live -> XSTS -> Minecraft Services...');
+            this.profile = await this.msaAuth.authenticateMinecraftWithMsaToken(tokens.accessToken, tokens.refreshToken);
+            onName(this.profile.name);
+            setLog(`Authenticated as ${this.profile.name} (UUID: ${this.profile.id})`);
+        } catch (err) {
+            setLog(`Microsoft OAuth Notice: ${(err as Error).message}`);
         }
     }
 
@@ -471,13 +670,12 @@ export class Minecraft263ClientApp {
         const hit = this.world.raycastBlock(this.px, eyeY, this.pz, fx, fy, fz, 5.5);
 
         if (button === 0) {
-            // Left click: Swing arm, check mob hit first, else break block
             this.isSwinging = true;
             this.swingProgress = 0;
 
             for (const ent of this.world.entities.values()) {
                 const dx = ent.x - this.px;
-                const dy = (ent.y + ent.height * 0.5) - eyeY;
+                const dy = ent.y + ent.height * 0.5 - eyeY;
                 const dz = ent.z - this.pz;
                 const dist = Math.hypot(dx, dy, dz);
                 if (dist < 4.0) {
@@ -487,7 +685,17 @@ export class Minecraft263ClientApp {
                         ent.vy = 0.36;
                         ent.vx += fx * 0.4;
                         ent.vz += fz * 0.4;
-                        this.audio.playSoundEvent('entity.player.attack.strong', SoundSource.PLAYERS, ent.x, ent.y, ent.z, 1.0, 1.0, true);
+                        this.playerStats.mobs_hit = (this.playerStats.mobs_hit || 0) + 1;
+                        this.audio.playSoundEvent(
+                            'entity.player.attack.strong',
+                            SoundSource.PLAYERS,
+                            ent.x,
+                            ent.y,
+                            ent.z,
+                            1.0,
+                            1.0,
+                            true
+                        );
                         return;
                     }
                 }
@@ -497,27 +705,43 @@ export class Minecraft263ClientApp {
                 const uv = this.mesher.getUV(hit.block.textures.north);
                 this.renderer.spawnBlockBreakParticles(hit.x, hit.y, hit.z, uv);
                 this.world.setBlockId(hit.x, hit.y, hit.z, this.world.idAir, true);
-                this.audio.playSoundEvent('block.stone.break', SoundSource.BLOCKS, hit.x + 0.5, hit.y + 0.5, hit.z + 0.5, 0.9, 0.95, true);
+                this.modifiedBlocksMap.set(`${hit.x},${hit.y},${hit.z}`, this.world.idAir);
+                this.playerStats.blocks_mined = (this.playerStats.blocks_mined || 0) + 1;
+                this.audio.playSoundEvent(
+                    'block.stone.break',
+                    SoundSource.BLOCKS,
+                    hit.x + 0.5,
+                    hit.y + 0.5,
+                    hit.z + 0.5,
+                    0.9,
+                    0.95,
+                    true
+                );
             }
         } else if (button === 2 && hit) {
-            // Right click: Place selected block at (hit.x + hit.nx, hit.y + hit.ny, hit.z + hit.nz)
             const tx = hit.x + hit.nx;
             const ty = hit.y + hit.ny;
             const tz = hit.z + hit.nz;
             const selected = this.hotbarBlocks[this.selectedHotbarSlot];
             if (!selected) return;
 
-            // Ensure placed block does not intersect player AABB
             const playerBox: AABB = {
-                minX: this.px - 0.3, minY: this.py, minZ: this.pz - 0.3,
-                maxX: this.px + 0.3, maxY: this.py + 1.8, maxZ: this.pz + 0.3,
+                minX: this.px - 0.3,
+                minY: this.py,
+                minZ: this.pz - 0.3,
+                maxX: this.px + 0.3,
+                maxY: this.py + 1.8,
+                maxZ: this.pz + 0.3,
             };
             if (
                 !selected.properties.noCollision &&
                 !selected.properties.liquid &&
-                playerBox.maxX > tx && playerBox.minX < tx + 1 &&
-                playerBox.maxY > ty && playerBox.minY < ty + 1 &&
-                playerBox.maxZ > tz && playerBox.minZ < tz + 1
+                playerBox.maxX > tx &&
+                playerBox.minX < tx + 1 &&
+                playerBox.maxY > ty &&
+                playerBox.minY < ty + 1 &&
+                playerBox.maxZ > tz &&
+                playerBox.minZ < tz + 1
             ) {
                 return;
             }
@@ -525,23 +749,33 @@ export class Minecraft263ClientApp {
             this.isSwinging = true;
             this.swingProgress = 0;
             this.world.setBlockId(tx, ty, tz, selected.rawId, true);
-            this.audio.playSoundEvent('block.stone.place', SoundSource.BLOCKS, tx + 0.5, ty + 0.5, tz + 0.5, 0.9, 1.05, true);
+            this.modifiedBlocksMap.set(`${tx},${ty},${tz}`, selected.rawId);
+            this.playerStats.blocks_placed = (this.playerStats.blocks_placed || 0) + 1;
+            this.audio.playSoundEvent(
+                'block.stone.place',
+                SoundSource.BLOCKS,
+                tx + 0.5,
+                ty + 0.5,
+                tz + 0.5,
+                0.9,
+                1.05,
+                true
+            );
         } else if (button === 1 && hit) {
-            // Middle click: Pick block into current hotbar slot
             this.hotbarBlocks[this.selectedHotbarSlot] = hit.block;
         }
     }
 
     /**
-     * Executes one fixed 20 TPS (50ms) client tick:
-     * - Steps player movement, jumping, creative flight, swimming, and VoxelShape AABB collisions
-     * - Steps world ticks (fluids, redstone, mobs)
-     * - Streams and remeshes dirty chunks around the player
+     * Executes one fixed 20 TPS (50ms) client tick when a world is active and not paused.
      */
     private clientTick(): void {
+        if (!this.inWorld || this.gui.activeScreen === 'pause') return;
+
         this.prevPx = this.px;
         this.prevPy = this.py;
         this.prevPz = this.pz;
+        this.playerStats.ticks_played = (this.playerStats.ticks_played || 0) + 1;
 
         if (this.isSwinging) {
             this.swingProgress += 0.22;
@@ -551,14 +785,13 @@ export class Minecraft263ClientApp {
             }
         }
 
-        // Compute horizontal input vector relative to yaw
         let forwardInput = 0;
         let strafeInput = 0;
-        if (!this.isInventoryOpen && !this.isMultiplayerOpen) {
-            if (this.keysDown.has('KeyW')) forwardInput += 1;
-            if (this.keysDown.has('KeyS')) forwardInput -= 1;
-            if (this.keysDown.has('KeyD')) strafeInput += 1;
-            if (this.keysDown.has('KeyA')) strafeInput -= 1;
+        if (this.gui.activeScreen === 'none') {
+            if (this.isKeyBoundPressed('key.forward')) forwardInput += 1;
+            if (this.isKeyBoundPressed('key.back')) forwardInput -= 1;
+            if (this.isKeyBoundPressed('key.right')) strafeInput += 1;
+            if (this.isKeyBoundPressed('key.left')) strafeInput -= 1;
         }
 
         const len = Math.hypot(forwardInput, strafeInput);
@@ -572,8 +805,13 @@ export class Minecraft263ClientApp {
         const wishX = -sinY * forwardInput + cosY * strafeInput;
         const wishZ = -cosY * forwardInput - sinY * strafeInput;
 
-        const isSprinting = this.keysDown.has('ControlLeft') || this.keysDown.has('ControlRight');
-        const isSneaking = this.keysDown.has('ShiftLeft') || this.keysDown.has('ShiftRight');
+        const isSprinting = this.pal.options.toggleSprint
+            ? this.sprintLatched
+            : this.isKeyBoundPressed('key.sprint');
+        const isSneaking = this.pal.options.toggleCrouch
+            ? this.sneakLatched
+            : this.isKeyBoundPressed('key.sneak');
+        const isJumping = this.gui.activeScreen === 'none' && this.isKeyBoundPressed('key.jump');
 
         const feetBlock = this.world.getBlockId(Math.floor(this.px), Math.floor(this.py), Math.floor(this.pz));
         const inWater = feetBlock === this.world.idWater;
@@ -583,25 +821,25 @@ export class Minecraft263ClientApp {
             this.vx = this.vx * 0.6 + wishX * flySpeed * 0.4;
             this.vz = this.vz * 0.6 + wishZ * flySpeed * 0.4;
             this.vy = 0;
-            if (this.keysDown.has('Space')) this.vy = 0.35;
+            if (isJumping) this.vy = 0.35;
             if (isSneaking) this.vy = -0.35;
         } else if (inWater) {
             const swimSpeed = 0.14;
             this.vx = this.vx * 0.8 + wishX * swimSpeed * 0.2;
             this.vz = this.vz * 0.8 + wishZ * swimSpeed * 0.2;
             this.vy = (this.vy - 0.02) * 0.85;
-            if (this.keysDown.has('Space')) this.vy += 0.06;
+            if (isJumping) this.vy += 0.06;
         } else {
             const baseAccel = isSneaking ? 0.06 : isSprinting ? 0.165 : 0.12;
             const friction = this.onGround ? 0.546 : 0.91;
             this.vx = this.vx * friction + wishX * baseAccel;
             this.vz = this.vz * friction + wishZ * baseAccel;
 
-            if (this.keysDown.has('Space') && this.onGround) {
-                this.vy = 0.42; // Exact vanilla jump velocity
+            if (isJumping && this.onGround) {
+                this.vy = 0.42;
                 this.onGround = false;
+                this.playerStats.jumps = (this.playerStats.jumps || 0) + 1;
             }
-            // Vanilla gravity (0.08 blocks/tick^2) and vertical drag (0.98)
             this.vy = (this.vy - 0.08) * 0.98;
         }
 
@@ -614,42 +852,61 @@ export class Minecraft263ClientApp {
             maxZ: this.pz + 0.3,
         };
         const moved = this.world.moveEntityWithCollisions(playerBox, this.vx, this.vy, this.vz);
-        this.px = (moved.box.minX + moved.box.maxX) * 0.5;
-        this.py = moved.box.minY;
-        this.pz = (moved.box.minZ + moved.box.maxZ) * 0.5;
-        this.onGround = moved.onGround;
+        const nextPx = (moved.box.minX + moved.box.maxX) * 0.5;
+        const nextPy = moved.box.minY;
+        const nextPz = (moved.box.minZ + moved.box.maxZ) * 0.5;
+
+        // Auto-Jump support (`options.autoJump`)
+        const horizBlocked =
+            Math.hypot(nextPx - this.px, nextPz - this.pz) < Math.hypot(this.vx, this.vz) * 0.5 &&
+            Math.hypot(wishX, wishZ) > 0.1;
+        if (this.pal.options.autoJump && this.onGround && horizBlocked && !isSneaking) {
+            this.vy = 0.42;
+            this.onGround = false;
+            this.playerStats.jumps = (this.playerStats.jumps || 0) + 1;
+        } else {
+            this.px = nextPx;
+            this.py = nextPy;
+            this.pz = nextPz;
+            this.onGround = moved.onGround;
+        }
+
         if (moved.onGround && this.vy < 0) {
             this.vy = 0;
             this.isFlying = false;
         }
 
-        // Footstep spatial sound trigger
+        const stepDist = Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+        this.playerStats.distance_walked_cm = (this.playerStats.distance_walked_cm || 0) + Math.round(stepDist * 100);
         if (this.onGround) {
-            this.stepDistanceAccum += Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+            this.stepDistanceAccum += stepDist;
             if (this.stepDistanceAccum > 1.85) {
                 this.stepDistanceAccum = 0;
                 this.audio.playSoundEvent('block.grass.step', SoundSource.PLAYERS, this.px, this.py, this.pz, 0.35, 1.0, false);
             }
         }
 
-        // Step world mechanics & particles
         this.world.tick(this.px, this.py, this.pz);
         this.renderer.stepParticles();
         this.workerPool.recordTickCompleted(Number(this.world.worldAgeTicks));
 
-        // Send multiplayer position update if connected
-        this.netClient?.sendPlayerPositionAndRotation(
-            this.px, this.py, this.pz,
-            (-this.yawRad * 180) / Math.PI,
-            (-this.pitchRad * 180) / Math.PI,
-            this.onGround
-        ).catch(() => {});
+        this.netClient
+            ?.sendPlayerPositionAndRotation(
+                this.px,
+                this.py,
+                this.pz,
+                (-this.yawRad * 180) / Math.PI,
+                (-this.pitchRad * 180) / Math.PI,
+                this.onGround
+            )
+            .catch(() => {});
 
-        // Stream & mesh nearby dirty chunks (at most 1 chunk per tick to avoid frame hitches)
+        // Stream & mesh nearby dirty chunks around the player according to `renderDistance`
+        const renderDist = Math.min(8, Math.max(2, this.pal.options.renderDistance));
         const pcx = Math.floor(this.px) >> 4;
         const pcz = Math.floor(this.pz) >> 4;
         let meshedThisTick = 0;
-        for (let r = 0; r <= this.renderDistanceChunks && meshedThisTick < 1; r++) {
+        for (let r = 0; r <= renderDist && meshedThisTick < 1; r++) {
             for (let dx = -r; dx <= r && meshedThisTick < 1; dx++) {
                 for (let dz = -r; dz <= r && meshedThisTick < 1; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
@@ -669,40 +926,86 @@ export class Minecraft263ClientApp {
     }
 
     private frameLoop(nowMs: number): void {
+        requestAnimationFrame((t) => this.frameLoop(t));
+
+        // Max Framerate limiter (`options.maxFps` when < 260)
+        const maxFps = this.pal?.options.maxFps ?? 120;
+        if (maxFps < 260 && this.inWorld) {
+            const minFrameInterval = 1000 / Math.max(10, maxFps);
+            if (nowMs - this.lastRenderedFrameMs < minFrameInterval - 0.5) {
+                return;
+            }
+        }
+        this.lastRenderedFrameMs = nowMs;
+
         const dtMs = Math.min(250, Math.max(0, nowMs - this.lastFrameTimeMs));
         this.lastFrameTimeMs = nowMs;
-        this.tickAccumulatorMs += dtMs;
 
-        // Fixed 20 TPS (50ms) tick loop
+        // Render GUI background canvas (`SplashOverlay`, `TitleScreen` Panorama, and sinusoidal splash text bounce)
+        this.gui?.renderFrame(nowMs);
+
+        if (!this.inWorld || !this.renderer || !this.world) {
+            return;
+        }
+
+        this.tickAccumulatorMs += dtMs;
         while (this.tickAccumulatorMs >= 50.0) {
             this.clientTick();
             this.tickAccumulatorMs -= 50.0;
         }
 
-        // Partial tick interpolation factor in [0.0 .. 1.0]
-        const partialTick = this.tickAccumulatorMs / 50.0;
+        const partialTick = this.gui.activeScreen === 'pause' ? 0 : this.tickAccumulatorMs / 50.0;
+        const isSneaking = this.pal.options.toggleCrouch
+            ? this.sneakLatched
+            : this.isKeyBoundPressed('key.sneak');
+        const eyeHeight = isSneaking ? 1.27 : 1.62;
+
+        // View Bobbing offset (`options.bobView`)
+        let bobY = 0;
+        if (this.pal.options.bobView && this.onGround && !this.isFlying) {
+            const speed = Math.hypot(this.px - this.prevPx, this.pz - this.prevPz);
+            bobY = Math.sin(this.stepDistanceAccum * Math.PI * 2.0) * Math.min(0.08, speed * 0.35);
+        }
+
         const renderX = this.prevPx + (this.px - this.prevPx) * partialTick;
-        const renderY = this.prevPy + (this.py - this.prevPy) * partialTick + 1.62;
+        const renderY = this.prevPy + (this.py - this.prevPy) * partialTick + eyeHeight + bobY;
         const renderZ = this.prevPz + (this.pz - this.prevPz) * partialTick;
 
-        this.audio.updateListener(renderX, renderY, renderZ, this.yawRad, this.pitchRad, this.vx * 20, this.vy * 20, this.vz * 20);
+        this.audio.updateListener(
+            renderX,
+            renderY,
+            renderZ,
+            this.yawRad,
+            this.pitchRad,
+            this.vx * 20,
+            this.vy * 20,
+            this.vz * 20
+        );
 
         const [fx, fy, fz] = this.getCameraForward();
         const hit = this.world.raycastBlock(renderX, renderY, renderZ, fx, fy, fz, 5.5);
 
-        // Render Passes 1–7 (3D World, Entities, BlockEntities, Particles, Sky/Clouds)
+        const baseFov = this.pal.options.fov || 70;
+        const isSprinting = this.pal.options.toggleSprint
+            ? this.sprintLatched
+            : this.isKeyBoundPressed('key.sprint');
+        const dynamicFov = baseFov + (isSprinting ? 10 * this.pal.options.fovEffectScale : 0);
+        const renderDist = Math.min(8, Math.max(2, this.pal.options.renderDistance));
+
         this.renderer.renderWorldFrame(
             this.world,
             this.mesher,
-            renderX, renderY, renderZ,
-            this.yawRad, this.pitchRad,
-            75.0,
-            this.renderDistanceChunks,
+            renderX,
+            renderY,
+            renderZ,
+            this.yawRad,
+            this.pitchRad,
+            dynamicFov,
+            renderDist,
             partialTick,
             hit
         );
 
-        // Update FPS counter
         this.frameCounter++;
         if (nowMs - this.lastFpsUpdateMs >= 500) {
             this.fps = Math.round((this.frameCounter * 1000) / (nowMs - this.lastFpsUpdateMs));
@@ -710,7 +1013,12 @@ export class Minecraft263ClientApp {
             this.lastFpsUpdateMs = nowMs;
         }
 
-        // Sample NoiseRouter values at player coordinates for F3 overlay
+        if (this.hideGuiF1) {
+            const guiCanvas = document.getElementById('game-canvas-gui') as HTMLCanvasElement;
+            guiCanvas.getContext('2d')?.clearRect(0, 0, guiCanvas.width, guiCanvas.height);
+            return;
+        }
+
         const nr = this.world.noiseRouter.sampleOverworldRouter(
             Math.floor(this.px),
             Math.floor(this.py),
@@ -720,15 +1028,20 @@ export class Minecraft263ClientApp {
             `C: ${nr.continents.toFixed(3)} E: ${nr.erosion.toFixed(3)} T: ${nr.temperature.toFixed(3)} ` +
             `V: ${nr.vegetation.toFixed(3)} W: ${nr.weirdness.toFixed(3)} PV: ${nr.ridges.toFixed(3)} D: ${nr.depth.toFixed(3)}`;
 
-        // Render Pass 8 (2D GUI, Hotbar, Health/Hunger/XP, Held Block, F3 Debug)
+        this.renderer.activeSubtitles = this.audio.activeSubtitles;
         this.renderer.render2DGuiPass({
             fps: this.fps,
             playerX: renderX,
-            playerY: renderY - 1.62,
+            playerY: renderY - eyeHeight,
             playerZ: renderZ,
             yawDeg: ((-this.yawRad * 180) / Math.PI) % 360,
             pitchDeg: (this.pitchRad * 180) / Math.PI,
-            biomeName: nr.biomeName,
+            biomeName:
+                this.world.worldType === 'flat'
+                    ? this.world.flatBiome
+                    : this.world.worldType === 'single_biome_surface'
+                    ? this.world.singleBiome
+                    : nr.biomeName,
             noiseSampleText,
             selectedHotbarSlot: this.selectedHotbarSlot,
             hotbarBlocks: this.hotbarBlocks,
@@ -742,8 +1055,6 @@ export class Minecraft263ClientApp {
             wispUrl: this.wisp.wispUrl,
             profileName: this.profile.name,
         });
-
-        requestAnimationFrame((t) => this.frameLoop(t));
     }
 }
 
@@ -751,7 +1062,5 @@ window.addEventListener('DOMContentLoaded', () => {
     const app = new Minecraft263ClientApp();
     app.start().catch((err) => {
         console.error('[Bootstrap] Fatal startup error:', err);
-        const label = document.getElementById('loading-status');
-        if (label) label.textContent = `Startup Error: ${(err as Error).message}`;
     });
 });

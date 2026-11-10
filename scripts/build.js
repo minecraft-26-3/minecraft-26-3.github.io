@@ -22,6 +22,7 @@ const MODULE_ORDER = [
     'runtime/vfs_nbt.ts',
     'runtime/openal_audio.ts',
     'runtime/worker_pool.ts',
+    'runtime/pal.ts',
     'network/wisp_epoxy.ts',
     'network/microsoft_auth.ts',
     'network/protocol_26_3.ts',
@@ -30,6 +31,7 @@ const MODULE_ORDER = [
     'renderer/shader_compiler.ts',
     'renderer/chunk_mesher.ts',
     'renderer/render_engine.ts',
+    'gui/vanilla_screens.ts',
     'bootstrap.ts',
 ];
 
@@ -115,7 +117,7 @@ async function runBuild() {
         chunks.push('})();\n');
         const finalJs = chunks.join('\n');
         fs.writeFileSync(path.join(PUBLIC_DIR, 'bootstrap.js'), finalJs, 'utf8');
-        console.log(`[Build] Compiled 14 TypeScript modules via Node v22 stripTypeScriptTypes -> public/bootstrap.js (${finalJs.length} bytes)`);
+        console.log(`[Build] Compiled ${MODULE_ORDER.length} TypeScript modules via Node v22 stripTypeScriptTypes -> public/bootstrap.js (${finalJs.length} bytes)`);
     }
 
     // Copy public/index.html and public/bootstrap.js to project root and dist/ so both root serving and dist/ serving work seamlessly
